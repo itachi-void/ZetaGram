@@ -26,6 +26,7 @@ from handlers.referrals import show_referral_menu, show_referrals_list
 from handlers.admin import admin_stats, add_task_admin
 from utils.security import rate_limiter
 from utils.anti_unsub_checker import run_anti_unsub_checker
+from utils.i18n import TEXTS
 
 # Setup logging
 logging.basicConfig(
@@ -39,35 +40,44 @@ async def post_init(application):
     # Start background anti-unsub checker worker
     asyncio.create_task(run_anti_unsub_checker(application.bot))
 
+def find_button_key(text: str) -> str | None:
+    for lang_code, text_dict in TEXTS.items():
+        for key, val in text_dict.items():
+            if key.startswith("btn_") and val == text:
+                return key
+    return None
+
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not rate_limiter.is_allowed(user_id):
         return
 
     text = update.message.text
+    key = find_button_key(text)
 
-    if text in ["👥 نظام الدعوات", "👥 Referral System"]:
+    if key == "btn_referrals":
         await show_referral_menu(update, context)
-    elif text in ["🎁 المكافأة اليومية", "🎁 Daily Bonus"]:
+    elif key == "btn_bonus":
         await claim_daily_bonus(update, context)
-    elif text in ["🧑‍💻 الأرباح", "🧑‍💻 Earnings"]:
+    elif key == "btn_earnings":
         await show_earnings_menu(update, context)
-    elif text in ["📣 الترويج", "📣 Promotion"]:
+    elif key == "btn_promotion":
         await show_promotion_menu(update, context)
-    elif text in ["📱 حسابي", "📱 My Account"]:
+    elif key == "btn_account":
         await show_account_info(update, context)
-    elif text in ["🏷️ الشيكات", "🏷️ Vouchers"]:
+    elif key == "btn_vouchers":
         await show_vouchers_menu(update, context)
-    elif text in ["روابط مفيدة", "Useful Links"]:
+    elif key == "btn_useful_links":
         await show_useful_links(update, context)
-    elif text in ["📋 التعليمات", "📋 Instructions"]:
+    elif key == "btn_instructions":
         await show_instructions(update, context)
-    elif text in ["روبوتاتنا والإحصائيات 📊", "Our Bots & Stats 📊"]:
+    elif key == "btn_stats":
         await show_bot_public_stats(update, context)
-    elif text in ["فحص الاشتراك 📣", "Check Subscription 📣"]:
+    elif key == "btn_check_sub":
         await check_forced_subscription(update, context)
-    elif text in ["🌐 اللغة / Language", "🌐 Language"]:
+    elif key == "btn_language":
         await show_language_menu(update, context)
+
 
 
 

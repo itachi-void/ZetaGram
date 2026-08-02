@@ -10,7 +10,7 @@ from utils.i18n import get_text, LANGUAGES
 def get_main_keyboard(lang: str = "ar"):
     return ReplyKeyboardMarkup(
         [
-            ["👥 نظام الدعوات", get_text(lang, "btn_bonus")],
+            [get_text(lang, "btn_referrals"), get_text(lang, "btn_bonus")],
             [get_text(lang, "btn_earnings"), get_text(lang, "btn_promotion")],
             [get_text(lang, "btn_account"), get_text(lang, "btn_vouchers")],
             [get_text(lang, "btn_stats"), get_text(lang, "btn_check_sub")],
@@ -58,11 +58,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(db_user)
             await session.commit()
 
-            # For first time users: prompt for language selection first!
-            text = (
-                "🌐 **يرجى اختيار لغتك المفضلّة للبدء:**\n"
-                "🌐 **Please select your preferred language to start:**"
-            )
+            # Detect initial language from Telegram settings if available
+            init_lang = user.language_code[:2] if user.language_code and user.language_code[:2] in LANGUAGES else "en"
+            text = get_text(init_lang, "select_lang_first")
             await update.message.reply_text(
                 text,
                 parse_mode="Markdown",
@@ -82,7 +80,7 @@ async def start_command_after_language(update: Update, context: ContextTypes.DEF
 
         # Check Captcha if not verified
         if db_user and not db_user.is_captcha_verified:
-            text, answer, options = generate_math_captcha()
+            text, answer, options = generate_math_captcha(lang)
             context.user_data["captcha_answer"] = answer
 
             keyboard = []
@@ -134,9 +132,13 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
     selected_val = int(query.data.split("_")[-1])
     correct_ans = context.user_data.get("captcha_answer")
 
+    async with AsyncSessionLocal() as session:
+        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+        lang = user.language if (user and user.language) else "ar"
+
     if selected_val != correct_ans:
-        await query.answer("❌ إجابة خاطئة! حاول مرة أخرى.", show_alert=True)
-        text, answer, options = generate_math_captcha()
+        await query.answer(get_text(lang, "captcha_wrong"), show_alert=True)
+        text, answer, options = generate_math_captcha(lang)
         context.user_data["captcha_answer"] = answer
         keyboard = []
         row = []
@@ -155,10 +157,9 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
         if user:
             user.is_captcha_verified = True
-            lang = user.language or "ar"
             await session.commit()
 
-    await query.answer("🎉 تم اجتياز اختبار الكابتشا بنجاح!", show_alert=True)
+    await query.answer(get_text(lang, "captcha_success"), show_alert=True)
     await query.delete_message()
     
     welcome_text = get_text(lang, "welcome", name=update.effective_user.first_name)
@@ -168,3 +169,4 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(lang)
     )
+

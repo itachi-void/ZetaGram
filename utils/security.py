@@ -1,5 +1,6 @@
 import time
 import random
+from utils.i18n import get_text
 
 class RateLimiter:
     def __init__(self, cooldown_seconds: float = 1.0):
@@ -16,7 +17,7 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(cooldown_seconds=1.0)
 
-def generate_math_captcha():
+def generate_math_captcha(lang: str = "ar"):
     num1 = random.randint(1, 10)
     num2 = random.randint(1, 10)
     answer = num1 + num2
@@ -30,4 +31,6 @@ def generate_math_captcha():
     options = list(wrong_answers) + [answer]
     random.shuffle(options)
     
-    return f"🤖 **اختبار الأمان (الكابتشا):**\nيرجى حل المسألة التالية لإكمال التسجيل:\n\nكم يساوي: `{num1} + {num2}` ؟", answer, options
+    captcha_msg = get_text(lang, "captcha_text", num1=num1, num2=num2)
+    return captcha_msg, answer, options
+
