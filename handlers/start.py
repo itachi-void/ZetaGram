@@ -10,14 +10,15 @@ from utils.i18n import get_text, LANGUAGES
 def get_main_keyboard(lang: str = "ar"):
     return ReplyKeyboardMarkup(
         [
-            [get_text(lang, "btn_bonus"), get_text(lang, "btn_earnings")],
-            [get_text(lang, "btn_promotion"), get_text(lang, "btn_account")],
-            [get_text(lang, "btn_vouchers"), get_text(lang, "btn_stats")],
-            [get_text(lang, "btn_check_sub"), get_text(lang, "btn_instructions")],
+            ["👥 نظام الدعوات", get_text(lang, "btn_bonus")],
+            [get_text(lang, "btn_earnings"), get_text(lang, "btn_promotion")],
+            [get_text(lang, "btn_account"), get_text(lang, "btn_vouchers")],
+            [get_text(lang, "btn_stats"), get_text(lang, "btn_check_sub")],
             [get_text(lang, "btn_useful_links"), get_text(lang, "btn_language")]
         ],
         resize_keyboard=True
     )
+
 
 def build_language_keyboard():
     keyboard = []

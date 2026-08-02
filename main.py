@@ -22,6 +22,7 @@ from handlers.info import (
 )
 from handlers.language import show_language_menu, set_language_callback
 from handlers.spin import spin_wheel_command
+from handlers.referrals import show_referral_menu, show_referrals_list
 from handlers.admin import admin_stats, add_task_admin
 from utils.security import rate_limiter
 from utils.anti_unsub_checker import run_anti_unsub_checker
@@ -45,7 +46,9 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = update.message.text
 
-    if text in ["🎁 المكافأة اليومية", "🎁 Daily Bonus"]:
+    if text in ["👥 نظام الدعوات", "👥 Referral System"]:
+        await show_referral_menu(update, context)
+    elif text in ["🎁 المكافأة اليومية", "🎁 Daily Bonus"]:
         await claim_daily_bonus(update, context)
     elif text in ["🧑‍💻 الأرباح", "🧑‍💻 Earnings"]:
         await show_earnings_menu(update, context)
@@ -68,6 +71,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
+
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not rate_limiter.is_allowed(user_id):
@@ -77,8 +81,13 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
-    if data.startswith("set_lang_"):
+    if data == "my_referrals_list":
+        await show_referrals_list(update, context)
+    elif data == "show_referral_main":
+        await show_referral_menu(update, context)
+    elif data.startswith("set_lang_"):
         await set_language_callback(update, context)
+
     elif data.startswith("captcha_val_"):
         await handle_captcha_callback(update, context)
     elif data == "earnings_menu":
