@@ -1,0 +1,17 @@
+# Environment variables & secrets
+.env
+
+# Database
+*.db
+bot.db
+
+# Python bytecode & virtual environment
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE / Editor files
+.vscode/
+.idea/
