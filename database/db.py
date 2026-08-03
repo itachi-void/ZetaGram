@@ -18,7 +18,12 @@ def migrate_sqlite_columns():
             "is_captcha_verified": "is_captcha_verified BOOLEAN DEFAULT 0",
             "last_daily_bonus": "last_daily_bonus DATETIME",
             "violations_count": "violations_count INTEGER DEFAULT 0",
-            "banned_until": "banned_until DATETIME"
+            "banned_until": "banned_until DATETIME",
+            "vip_level": "vip_level INTEGER DEFAULT 1",
+            "claimed_milestones": "claimed_milestones VARCHAR(256) DEFAULT ''",
+            "last_active_at": "last_active_at DATETIME",
+            "failed_voucher_attempts": "failed_voucher_attempts INTEGER DEFAULT 0",
+            "voucher_banned_until": "voucher_banned_until DATETIME"
         }
         for col_name, col_sql in cols_to_add_users.items():
             if col_name not in existing_user_cols:
@@ -28,6 +33,13 @@ def migrate_sqlite_columns():
         existing_ut_cols = [c[1] for c in cursor.execute("PRAGMA table_info(user_tasks)").fetchall()]
         if "unsubscribed" not in existing_ut_cols:
             cursor.execute("ALTER TABLE user_tasks ADD COLUMN unsubscribed BOOLEAN DEFAULT 0")
+        if "rejection_reason" not in existing_ut_cols:
+            cursor.execute("ALTER TABLE user_tasks ADD COLUMN rejection_reason TEXT")
+
+        # Voucher columns
+        existing_v_cols = [c[1] for c in cursor.execute("PRAGMA table_info(vouchers)").fetchall()]
+        if "created_by" not in existing_v_cols:
+            cursor.execute("ALTER TABLE vouchers ADD COLUMN created_by BIGINT")
 
         conn.commit()
         conn.close()
@@ -42,4 +54,3 @@ async def init_db():
 async def get_session():
     async with AsyncSessionLocal() as session:
         yield session
-

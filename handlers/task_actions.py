@@ -4,10 +4,10 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from sqlalchemy import select, and_, func
 from database.db import AsyncSessionLocal
-from database.models import Task, User, UserTask
+from database.models import Task, User, UserTask, Transaction
 from utils.telegram_api import check_user_subscription
 from utils.pagination import build_pagination_keyboard
-
+from utils.security import user_lock_manager
 
 PAGE_SIZE = 10
 
@@ -18,7 +18,7 @@ async def handle_task_list(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await query.answer()
 
     async with AsyncSessionLocal() as session:
-        # Get tasks user hasn't completed yet
+        # Get tasks user hasn't completed or pending yet
         completed_task_ids_res = await session.execute(
             select(UserTask.task_id).where(UserTask.user_id == user_id)
         )
@@ -86,14 +86,13 @@ async def handle_task_list(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 ]
             elif task_type in ["reaction_random", "reaction_fixed"]:
                 row = [
-                    InlineKeyboardButton(f"💰 بدون مراجعة تفاعل | +{t.reward_grams:,} غرام", url=t.target_url)
+                    InlineKeyboardButton(f"💰 تفاعل | +{t.reward_grams:,} غرام", url=t.target_url)
                 ]
             else:
                 row = [
-                    InlineKeyboardButton(f"💰 بدون مراجعة 🤖 الانتقال إلى البوت | +{t.reward_grams:,} غرام", url=t.target_url)
+                    InlineKeyboardButton(f"💰 🤖 الانتقال إلى البوت | +{t.reward_grams:,} غرام", url=t.target_url)
                 ]
             items_buttons.append(row)
-
 
     reply_markup = build_pagination_keyboard(
         items_buttons=items_buttons,
@@ -113,68 +112,80 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     task_id = int(query.data.split("_")[-1])
 
-    async with AsyncSessionLocal() as session:
-        # Check user ban status
-        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
-        if user and user.banned_until and datetime.utcnow() < user.banned_until:
-            ban_str = user.banned_until.strftime("%Y-%m-%d %H:%M UTC")
-            await query.answer(f"❌ أنت محظور حالياً من تنفيذ المهام حتى ({ban_str}) بسبب مخالفات إلغاء الاشتراك!", show_alert=True)
-            return
-
-        # Check task status
-        task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
-        if not task or task.status != "active":
-            await query.answer("❌ هذه المهمة غير متاحة الآن أو تم انتهائها.", show_alert=True)
-            return
-
-        already_done = (await session.execute(
-            select(UserTask).where(and_(UserTask.user_id == user_id, UserTask.task_id == task_id))
-        )).scalar_one_or_none()
-
-        if already_done:
-            await query.answer("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!", show_alert=True)
-            return
-
-        # Perform subscription verification
-        if task.chat_id:
-            is_subbed = await check_user_subscription(context.bot, task.chat_id, user_id)
-            if not is_subbed:
-                await query.answer("❌ لم يتم التحقق من الانضمام بعد! يرجى الاشتراك في القناة/المجموعة ثم الضغط على فحص.", show_alert=True)
+    async with user_lock_manager.get_lock(user_id):
+        async with AsyncSessionLocal() as session:
+            user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+            if user and user.banned_until and datetime.utcnow() < user.banned_until:
+                ban_str = user.banned_until.strftime("%Y-%m-%d %H:%M UTC")
+                await query.answer(f"❌ أنت محظور حالياً من تنفيذ المهام حتى ({ban_str}) بسبب مخالفات إلغاء الاشتراك!", show_alert=True)
                 return
 
-        # Record completion & reward user
-        if user:
-            user.balance += task.reward_grams
+            task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+            if not task or task.status != "active":
+                await query.answer("❌ هذه المهمة غير متاحة الآن أو تم انتهائها.", show_alert=True)
+                return
 
-        task.completed_qty += 1
-        if task.completed_qty >= task.total_qty:
-            task.status = "completed"
+            already_done = (await session.execute(
+                select(UserTask).where(and_(UserTask.user_id == user_id, UserTask.task_id == task_id))
+            )).scalar_one_or_none()
 
-        submission = UserTask(user_id=user_id, task_id=task_id, status="completed")
-        session.add(submission)
+            if already_done:
+                await query.answer("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!", show_alert=True)
+                return
 
-        # Check for 3-task referral reward trigger
-        user_tasks_count = (await session.execute(
-            select(func.count(UserTask.id)).where(UserTask.user_id == user_id)
-        )).scalar() or 0
+            # Perform subscription verification
+            if task.chat_id:
+                is_subbed = await check_user_subscription(context.bot, task.chat_id, user_id)
+                if not is_subbed:
+                    await query.answer("❌ لم يتم التحقق من الانضمام بعد! يرجى الاشتراك في القناة/المجموعة ثم الضغط على فحص.", show_alert=True)
+                    return
 
-        if user_tasks_count == 3 and user and user.referred_by:
-            referrer = (await session.execute(select(User).where(User.telegram_id == user.referred_by))).scalar_one_or_none()
-            if referrer:
-                referrer.balance += 250 # +250 Grams referral reward
-                try:
-                    await context.bot.send_message(
-                        chat_id=referrer.telegram_id,
-                        text=f"🎉 **مبروك!** لقد أكمل صديقك الموصى به 3 مهام، وتم إضافة +250 غرام إلى رصيدك!",
-                        parse_mode="Markdown"
+            # Record completion & reward user
+            if user:
+                user.balance += task.reward_grams
+                tx = Transaction(
+                    user_id=user_id,
+                    trans_type="earn_task",
+                    amount=task.reward_grams,
+                    description=f"كسب من مهمة: {task.title}"
+                )
+                session.add(tx)
+
+            task.completed_qty += 1
+            if task.completed_qty >= task.total_qty:
+                task.status = "completed"
+
+            submission = UserTask(user_id=user_id, task_id=task_id, status="completed")
+            session.add(submission)
+
+            # Check for 3-task referral reward trigger
+            user_tasks_count = (await session.execute(
+                select(func.count(UserTask.id)).where(UserTask.user_id == user_id)
+            )).scalar() or 0
+
+            if user_tasks_count == 3 and user and user.referred_by:
+                referrer = (await session.execute(select(User).where(User.telegram_id == user.referred_by))).scalar_one_or_none()
+                if referrer:
+                    referrer.balance += 250
+                    tx_ref = Transaction(
+                        user_id=referrer.telegram_id,
+                        trans_type="reward",
+                        amount=250,
+                        description=f"مكافأة دعوة صديق ({user_id}) أتم 3 مهام"
                     )
-                except Exception:
-                    pass
+                    session.add(tx_ref)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer.telegram_id,
+                            text=f"🎉 **مبروك!** لقد أكمل صديقك الموصى به 3 مهام، وتم إضافة +250 غرام إلى رصيدك!",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
 
-        await session.commit()
+            await session.commit()
 
-        await query.answer(f"🎉 تم التحقق بنجاح! تم إضافة +{task.reward_grams:,} غرام إلى رصيدك.", show_alert=True)
+            await query.answer(f"🎉 تم التحقق بنجاح! تم إضافة +{task.reward_grams:,} غرام إلى رصيدك.", show_alert=True)
 
-        # Refresh tasks view
-        await handle_task_list(update, context, task.task_type)
-
+            # Refresh tasks view
+            await handle_task_list(update, context, task.task_type)

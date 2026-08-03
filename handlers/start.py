@@ -6,6 +6,7 @@ from database.models import User
 from config import REQUIRED_CHANNEL, REQUIRED_CHANNEL_LINK
 from utils.security import generate_math_captcha
 from utils.i18n import get_text, LANGUAGES
+from handlers.vouchers import redeem_voucher
 
 def get_main_keyboard(lang: str = "ar"):
     return ReplyKeyboardMarkup(
@@ -18,7 +19,6 @@ def get_main_keyboard(lang: str = "ar"):
         ],
         resize_keyboard=True
     )
-
 
 def build_language_keyboard():
     keyboard = []
@@ -38,7 +38,16 @@ def build_language_keyboard():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
-    referred_by = int(args[0]) if args and args[0].isdigit() else None
+    
+    voucher_code = None
+    referred_by = None
+    
+    if args and len(args) > 0:
+        arg0 = args[0]
+        if arg0.startswith("v_"):
+            voucher_code = arg0[2:]
+        elif arg0.isdigit():
+            referred_by = int(arg0)
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).where(User.telegram_id == user.id))
@@ -58,7 +67,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(db_user)
             await session.commit()
 
-            # Detect initial language from Telegram settings if available
             init_lang = user.language_code[:2] if user.language_code and user.language_code[:2] in LANGUAGES else "en"
             text = get_text(init_lang, "select_lang_first")
             await update.message.reply_text(
@@ -66,10 +74,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=build_language_keyboard()
             )
+            if voucher_code:
+                context.user_data["pending_voucher_redeem"] = voucher_code
             return
 
         lang = db_user.language or "ar"
         await start_command_after_language(update, context, lang)
+
+    if voucher_code:
+        await redeem_voucher(update, context, voucher_code)
 
 async def start_command_after_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
     user_id = update.effective_user.id
@@ -78,7 +91,6 @@ async def start_command_after_language(update: Update, context: ContextTypes.DEF
     async with AsyncSessionLocal() as session:
         db_user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
 
-        # Check Captcha if not verified
         if db_user and not db_user.is_captcha_verified:
             text, answer, options = generate_math_captcha(lang)
             context.user_data["captcha_answer"] = answer
@@ -170,3 +182,6 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=get_main_keyboard(lang)
     )
 
+    pending_v = context.user_data.pop("pending_voucher_redeem", None)
+    if pending_v:
+        await redeem_voucher(update, context, pending_v)

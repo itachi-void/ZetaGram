@@ -5,7 +5,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from sqlalchemy import select
 from database.db import AsyncSessionLocal
-from database.models import User
+from database.models import User, Transaction
+from utils.security import user_lock_manager
 
 # Prize pools with probability weights
 PRIZES = [
@@ -25,31 +26,41 @@ async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     now = datetime.utcnow()
 
-    async with AsyncSessionLocal() as session:
-        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
-        if not user:
-            await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
-            return
-
-        if user.last_spin_time:
-            elapsed = now - user.last_spin_time
-            if elapsed < timedelta(hours=24):
-                remaining = timedelta(hours=24) - elapsed
-                hours, remainder = divmod(remaining.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-                
-                await update.message.reply_text(
-                    f"⌛ **لقد استخدمت لفة اليوم بالفعل!**\n\n"
-                    f"يمكنك تدوير عجلة الحظ مجدداً بعد: **{hours} ساعة و {minutes} دقيقة**.",
-                    parse_mode="Markdown"
-                )
+    async with user_lock_manager.get_lock(user_id):
+        async with AsyncSessionLocal() as session:
+            user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+            if not user:
+                await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
                 return
 
-        # Pick prize and update user balance
-        prize = pick_prize()
-        user.balance += prize
-        user.last_spin_time = now
-        await session.commit()
+            if user.last_spin_time:
+                elapsed = now - user.last_spin_time
+                if elapsed < timedelta(hours=24):
+                    remaining = timedelta(hours=24) - elapsed
+                    hours, remainder = divmod(remaining.seconds, 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    
+                    await update.message.reply_text(
+                        f"⌛ **لقد استخدمت لفة اليوم بالفعل!**\n\n"
+                        f"يمكنك تدوير عجلة الحظ مجدداً بعد: **{hours} ساعة و {minutes} دقيقة**.",
+                        parse_mode="Markdown"
+                    )
+                    return
+
+            # Pick prize and update user balance
+            prize = pick_prize()
+            user.balance += prize
+            user.last_spin_time = now
+
+            tx = Transaction(
+                user_id=user_id,
+                trans_type="spin",
+                amount=prize,
+                description="جائزة عجلة الحظ"
+            )
+            session.add(tx)
+            await session.commit()
+            new_balance = user.balance
 
     # Wheel spinning animation
     msg = await update.message.reply_text("🎰 **جاري تدوير عجلة الحظ...**\n\n🌀 `[ 100 | 500 | 50 | 1000 | 250 | 2000 ]` 🌀")
@@ -66,7 +77,7 @@ async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🎰 **نتيجة عجلة الحظ:**\n\n"
         f"{badge}"
         f"🎁 **مبروك! فزت بـ:** `+{prize:,}` غرام!\n"
-        f"💳 **رصيدك الحالي:** `{user.balance:,}` غرام\n\n"
+        f"💳 **رصيدك الحالي:** `{new_balance:,}` غرام\n\n"
         f"عد غداً لتدوير العجلة والحصول على الجائزة القادمة! 🎡"
     )
 

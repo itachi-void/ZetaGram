@@ -3,7 +3,7 @@ from telegram.ext import ContextTypes
 from sqlalchemy import select, func
 from database.db import AsyncSessionLocal
 from database.models import User, UserTask
-from config import BOT_TOKEN
+from handlers.levels import LEVEL_TITLES
 
 async def show_account_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -26,12 +26,14 @@ async def show_account_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )).scalar() or 0
 
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    level_title = LEVEL_TITLES.get(user.vip_level or 1, "🥉 مبتدئ")
 
     text = (
         f"📱 **معلومات حسابك في PR GRAM:**\n\n"
         f"🆔 **معرف الحساب:** `{user.telegram_id}`\n"
         f"👤 **الاسم:** {user.first_name}\n"
-        f"💰 **الرصيد الحرفي:** `{user.balance:,}` غرام\n"
+        f"🏅 **المستوى:** {level_title}\n"
+        f"💰 **الرصيد:** `{user.balance:,}` غرام\n"
         f"✅ **المهام المكتملة:** {completed_count}\n"
         f"👥 **عدد الإحالات:** {referrals_count}\n\n"
         f"🔗 **رابط الإحالة الخاص بك:**\n"
@@ -40,8 +42,18 @@ async def show_account_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        [InlineKeyboardButton("➕ شحن الرصيد", callback_data="deposit_funds"), InlineKeyboardButton("💸 سحب الأرباح", callback_data="withdraw_funds")],
-        [InlineKeyboardButton("🏷️ شيكاتي", callback_data="my_vouchers")]
+        [
+            InlineKeyboardButton("🏅 الإنجازات والمستويات", callback_data="show_levels"),
+            InlineKeyboardButton("📜 سجل المعاملات", callback_data="show_tx_history")
+        ],
+        [
+            InlineKeyboardButton("🏛️ الخزنة والاستثمار", callback_data="show_vault_menu"),
+            InlineKeyboardButton("🎟️ اليانصيب والسحب", callback_data="show_raffle_menu")
+        ],
+        [
+            InlineKeyboardButton("💸 تحويل رصيد", callback_data="show_transfer_menu"),
+            InlineKeyboardButton("🏷️ الشيكات والكوبونات", callback_data="my_vouchers")
+        ]
     ]
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))

@@ -3,7 +3,8 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from sqlalchemy import select
 from database.db import AsyncSessionLocal
-from database.models import User
+from database.models import User, Transaction
+from utils.security import user_lock_manager
 
 BONUS_AMOUNT = 100 # 100 Grams daily reward
 
@@ -11,35 +12,44 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.utcnow()
 
-    async with AsyncSessionLocal() as session:
-        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
-        if not user:
-            await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
-            return
-
-        if user.last_daily_bonus:
-            elapsed = now - user.last_daily_bonus
-            if elapsed < timedelta(hours=24):
-                remaining = timedelta(hours=24) - elapsed
-                hours, remainder = divmod(remaining.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-                
-                await update.message.reply_text(
-                    f"⌛ **لقد حصلت على مكافأتك اليومية بالفعل!**\n\n"
-                    f"يمكنك المطالبة بالمكافأة القادمة بعد: **{hours} ساعة و {minutes} دقيقة**.",
-                    parse_mode="Markdown"
-                )
+    async with user_lock_manager.get_lock(user_id):
+        async with AsyncSessionLocal() as session:
+            user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+            if not user:
+                await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
                 return
 
-        # Grant daily bonus
-        user.balance += BONUS_AMOUNT
-        user.last_daily_bonus = now
-        await session.commit()
+            if user.last_daily_bonus:
+                elapsed = now - user.last_daily_bonus
+                if elapsed < timedelta(hours=24):
+                    remaining = timedelta(hours=24) - elapsed
+                    hours, remainder = divmod(remaining.seconds, 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    
+                    await update.message.reply_text(
+                        f"⌛ **لقد حصلت على مكافأتك اليومية بالفعل!**\n\n"
+                        f"يمكنك المطالبة بالمكافأة القادمة بعد: **{hours} ساعة و {minutes} دقيقة**.",
+                        parse_mode="Markdown"
+                    )
+                    return
 
-        await update.message.reply_text(
-            f"🎁 **مبروك! تم إضافة المكافأة اليومية إلى رصيدك!**\n\n"
-            f"💰 **الهدية:** +{BONUS_AMOUNT:,} غرام\n"
-            f"💳 **رصيدك الحالي:** {user.balance:,} غرام\n\n"
-            f"عد غداً للحصول على مكافأة جديدة!",
-            parse_mode="Markdown"
-        )
+            # Grant daily bonus
+            user.balance += BONUS_AMOUNT
+            user.last_daily_bonus = now
+
+            tx = Transaction(
+                user_id=user_id,
+                trans_type="daily_bonus",
+                amount=BONUS_AMOUNT,
+                description="مكافأة يومية مجانية"
+            )
+            session.add(tx)
+            await session.commit()
+
+            await update.message.reply_text(
+                f"🎁 **مبروك! تم إضافة المكافأة اليومية إلى رصيدك!**\n\n"
+                f"💰 **الهدية:** +{BONUS_AMOUNT:,} غرام\n"
+                f"💳 **رصيدك الحالي:** {user.balance:,} غرام\n\n"
+                f"عد غداً للحصول على مكافأة جديدة!",
+                parse_mode="Markdown"
+            )
