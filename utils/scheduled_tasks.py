@@ -18,6 +18,7 @@ from database.models import (
 )
 from utils.security import user_lock_manager
 from utils.rewards import award_task_completion, dispatch_completion_notifications
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc, utcnow
 
 
@@ -93,17 +94,14 @@ async def run_retention_reminders_once(bot, batch_size: int = 100) -> int:
         targets = []
         for u in inactive_users:
             u.last_reminded_at = now
-            targets.append((u.telegram_id, u.first_name or ""))
+            targets.append((u.telegram_id, u.first_name or "", get_user_lang(u)))
         await session.commit()
 
-    for uid, fname in targets:
+    for uid, fname, u_lang in targets:
         try:
             await bot.send_message(
                 chat_id=uid,
-                text=(
-                    f"👋 <b>مرحباً {esc(fname)}!</b> نسينا أن نذكرك بالمكافأة اليومية في ZetaGram! 🎁\n\n"
-                    f"ادخل البوت الآن واحصل على مكافأتك التصاعدية + عجلة الحظ والتحدي اليومي! 🎡"
-                ),
+                text=get_text(u_lang, "notif_retention_reminder", name=esc(fname)),
                 parse_mode="HTML",
             )
             sent_count += 1
@@ -251,6 +249,8 @@ async def auto_approve_pending_proofs_once(bot, now=None) -> int:
     for ut_id, uid, tid in pending_ids:
         reward_info = None
         creator_id = None
+        creator_lang = "ar"
+        worker_lang = "ar"
         task_title = ""
         async with user_lock_manager.acquire_ordered_locks(("ut", ut_id), ("user", uid), ("task", tid)):
             async with AsyncSessionLocal() as session:
@@ -267,6 +267,12 @@ async def auto_approve_pending_proofs_once(bot, now=None) -> int:
                     session, bot, user, task, ut, target_status="approved"
                 )
                 creator_id = task.created_by
+                worker_lang = get_user_lang(user)
+                if creator_id:
+                    cr_user = (
+                        await session.execute(select(User).where(User.telegram_id == creator_id))
+                    ).scalar_one_or_none()
+                    creator_lang = get_user_lang(cr_user)
                 task_title = task.title
                 await session.commit()
                 approved_count += 1
@@ -276,10 +282,11 @@ async def auto_approve_pending_proofs_once(bot, now=None) -> int:
             try:
                 await bot.send_message(
                     chat_id=uid,
-                    text=(
-                        f"✅ <b>تمت الموافقة التلقائية على إثباتك!</b>\n"
-                        f"المهمة: <b>{esc(task_title)}</b>\n"
-                        f"💰 تمت إضافة <b>+{reward_info['total_reward']:,} غرام</b> إلى رصيدك بعد انتهاء مهلة المراجعة."
+                    text=get_text(
+                        worker_lang,
+                        "notif_proof_auto_approved_worker",
+                        title=esc(task_title),
+                        reward=reward_info["total_reward"],
                     ),
                     parse_mode="HTML",
                 )
@@ -289,9 +296,12 @@ async def auto_approve_pending_proofs_once(bot, now=None) -> int:
                 try:
                     await bot.send_message(
                         chat_id=creator_id,
-                        text=(
-                            f"⏱️ <b>اعتماد تلقائي لإثبات معلق:</b>\n"
-                            f"تم اعتماد إثبات المستخدم <code>{uid}</code> في مهمة <b>{esc(task_title)}</b> تلقائياً لتجاوز مهلة {AUTO_APPROVE_PROOF_HOURS} ساعة."
+                        text=get_text(
+                            creator_lang,
+                            "notif_proof_auto_approved_creator",
+                            worker_id=uid,
+                            title=esc(task_title),
+                            hours=AUTO_APPROVE_PROOF_HOURS,
                         ),
                         parse_mode="HTML",
                     )
@@ -366,6 +376,7 @@ async def distribute_weekly_leaderboard_once(bot, now=None) -> dict | None:
             ).all()
 
             awarded = []
+            notify_meta = []
             for rank_idx, (uid, cnt) in enumerate(top_taskers):
                 prize = LEADERBOARD_PRIZES[rank_idx]
                 u = (await session.execute(select(User).where(User.telegram_id == uid))).scalar_one_or_none()
@@ -380,6 +391,7 @@ async def distribute_weekly_leaderboard_once(bot, now=None) -> dict | None:
                         )
                     )
                     awarded.append((uid, prize, f"المهام #{rank_idx + 1}"))
+                    notify_meta.append((uid, prize, "lb_btn_tasks", rank_idx + 1, get_user_lang(u)))
 
             for rank_idx, (uid, cnt) in enumerate(top_referrers):
                 prize = LEADERBOARD_PRIZES[rank_idx]
@@ -395,18 +407,22 @@ async def distribute_weekly_leaderboard_once(bot, now=None) -> dict | None:
                         )
                     )
                     awarded.append((uid, prize, f"الإحالات #{rank_idx + 1}"))
+                    notify_meta.append((uid, prize, "lb_btn_refs", rank_idx + 1, get_user_lang(u)))
 
             session.add(WeeklyLeaderboardRun(week_key=week_key))
             await session.commit()
 
-    for uid, prize, category in awarded:
+    for uid, prize, cat_key, rank_num, u_lang in notify_meta:
+        cat_label = f"{get_text(u_lang, cat_key)} #{rank_num}"
         try:
             await bot.send_message(
                 chat_id=uid,
-                text=(
-                    f"🏆 <b>مبروك! فزت بجائزة المتصدرين الأسبوعية ({week_key})!</b>\n"
-                    f"📌 التصنيف: <b>{esc(category)}</b>\n"
-                    f"🎁 الجائزة: <b>+{prize:,} غرام</b> تم إضافتها لرصيدك!"
+                text=get_text(
+                    u_lang,
+                    "notif_leaderboard_winner",
+                    week_key=week_key,
+                    category=esc(cat_label),
+                    prize=prize,
                 ),
                 parse_mode="HTML",
             )

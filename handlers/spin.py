@@ -9,6 +9,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, Transaction
 from utils.security import user_lock_manager
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import utcnow
 
 PRIZES = [
@@ -27,11 +28,12 @@ def pick_prize():
 
 
 async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     now = utcnow()
 
     async with user_lock_manager.get_lock(user_id):
@@ -40,8 +42,10 @@ async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user:
-                await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
+                await update.message.reply_text(get_text(lang, "not_registered"))
                 return
+
+            lang = get_user_lang(user)
 
             if user.last_spin_time:
                 elapsed = now - user.last_spin_time
@@ -51,8 +55,7 @@ async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     minutes, _ = divmod(remainder, 60)
 
                     await update.message.reply_text(
-                        f"⌛ <b>لقد استخدمت لفة اليوم بالفعل!</b>\n\n"
-                        f"يمكنك تدوير عجلة الحظ مجدداً بعد: <b>{hours} ساعة و {minutes} دقيقة</b>.",
+                        get_text(lang, "spin_already_used", hours=hours, minutes=minutes),
                         parse_mode="HTML",
                     )
                     return
@@ -73,27 +76,27 @@ async def spin_wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_balance = user.balance
 
     msg = await update.message.reply_text(
-        "🎰 <b>جاري تدوير عجلة الحظ...</b>\n\n🌀 <code>[ 100 | 500 | 50 | 1000 | 250 | 2000 ]</code> 🌀",
+        get_text(lang, "spin_rolling_1"),
         parse_mode="HTML",
     )
     await asyncio.sleep(1.0)
 
     await msg.edit_text(
-        "🎰 <b>جاري التدوير... ⚡</b>\n\n🌀 <code>[ 250 | 2000 | 50 | 500 | 1000 ]</code> 🌀",
+        get_text(lang, "spin_rolling_2"),
         parse_mode="HTML",
     )
     await asyncio.sleep(1.0)
 
     is_jackpot = prize >= 1000
-    badge = "🎉 <b>الجائزة الكبرى (JACKPOT)!</b> 🎉\n" if is_jackpot else ""
+    badge = get_text(lang, "spin_jackpot_badge") if is_jackpot else ""
 
-    text = (
-        f"🎰 <b>نتيجة عجلة الحظ:</b>\n\n"
-        f"{badge}"
-        f"🎁 <b>مبروك! فزت بـ:</b> <code>+{prize:,}</code> غرام!\n"
-        f"💳 <b>رصيدك الحالي:</b> <code>{new_balance:,}</code> غرام\n\n"
-        f"عد غداً لتدوير العجلة والحصول على الجائزة القادمة! 🎡"
+    text = get_text(
+        lang,
+        "spin_result",
+        badge=badge,
+        prize=prize,
+        balance=new_balance,
     )
 
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")]]
+    keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")]]
     await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))

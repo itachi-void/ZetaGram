@@ -30,6 +30,7 @@ _INPUT_STATE_KEYS = (
     "awaiting_promo_price",
     "awaiting_promo_qty",
     "awaiting_promo_target",
+    "awaiting_promo_code",
     "awaiting_report_task_id",
     "awaiting_reject_reason_ut_id",
     "awaiting_bot_forward_task_id",
@@ -63,7 +64,7 @@ def reset_gatekeeper_caches():
     _last_allowed_update.clear()
 
 
-async def get_mandatory_channels_list():
+async def get_mandatory_channels_list(lang: str = "ar"):
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(MandatoryChannel).where(MandatoryChannel.is_active == True)
@@ -78,7 +79,7 @@ async def get_mandatory_channels_list():
                 "id": 0,
                 "channel_username": REQUIRED_CHANNEL,
                 "channel_link": REQUIRED_CHANNEL_LINK,
-                "title": "القناة الرسمية",
+                "title": get_text(lang, "default_official_channel"),
             }
         ]
     return [
@@ -128,6 +129,7 @@ async def enforce_user_access(
 
     user_id = update.effective_user.id
     is_admin = user_id in ADMIN_IDS
+    hint_lang = (getattr(update.effective_user, "language_code", None) or "ar")[:2].lower()
 
     now_ts = time.time()
     if apply_rate_limit and not is_admin:
@@ -140,7 +142,9 @@ async def enforce_user_access(
             if not rate_limiter.is_allowed(user_id):
                 if update.callback_query:
                     try:
-                        await update.callback_query.answer(get_text("ar", "rate_limited"), show_alert=True)
+                        await update.callback_query.answer(
+                            get_text(hint_lang, "rate_limited"), show_alert=True
+                        )
                     except Exception:
                         pass
                 return False, None
@@ -156,7 +160,7 @@ async def enforce_user_access(
         ).scalar_one_or_none()
 
         if not user:
-            await _reply_or_alert(update, context, "❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
+            await _reply_or_alert(update, context, get_text(hint_lang, "not_registered"))
             return False, None
 
         if should_touch_activity:
@@ -166,7 +170,7 @@ async def enforce_user_access(
             if len(_last_activity_write) > 5000:
                 _last_activity_write.clear()
 
-    lang = user.language or "ar"
+    lang = (user.language or "ar").lower()
 
     if require_unbanned and not is_admin:
         if user.banned_until and now_dt < user.banned_until:
@@ -188,7 +192,7 @@ async def enforce_user_access(
             return False, user
 
     if require_mandatory_sub and not is_admin:
-        channels = await get_mandatory_channels_list()
+        channels = await get_mandatory_channels_list(lang=lang)
         if channels:
             unsubbed = []
             for ch in channels:
@@ -222,7 +226,9 @@ async def enforce_user_access(
                     [InlineKeyboardButton(f"📢 {ch['title']}", url=ch["channel_link"])]
                     for ch in unsubbed
                 ]
-                keyboard.append([InlineKeyboardButton("🔄 تحقق الآن", callback_data="recheck_forced_sub")])
+                keyboard.append(
+                    [InlineKeyboardButton(get_text(lang, "btn_recheck_now"), callback_data="recheck_forced_sub")]
+                )
                 await _reply_or_alert(
                     update,
                     context,

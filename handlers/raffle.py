@@ -8,6 +8,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, RaffleTicket, RaffleDraw, Transaction
 from utils.security import user_lock_manager, is_admin_user
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import utcnow
 
 TICKET_PRICE = 100
@@ -30,12 +31,13 @@ async def get_or_create_active_draw(session):
 
 
 async def show_raffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     if query:
         await query.answer()
 
@@ -59,29 +61,35 @@ async def show_raffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = (
             await session.execute(select(User).where(User.telegram_id == user_id))
         ).scalar_one_or_none()
+        if user:
+            lang = get_user_lang(user)
         balance = user.balance if user else 0
 
-    text = (
-        f"🎟️ <b>نظام السحب واليانصيب الأسبوعي (Weekly Raffle):</b>\n\n"
-        f"اشترِ تذاكر الدخول ونافس باقي الأعضاء على مسبح الجوائز الأسبوعي الضخم!\n\n"
-        f"🏆 <b>مسبح الجوائز الحالي:</b> <code>{draw.prize_pool:,}</code> غرام\n"
-        f"🎫 <b>تذكرتك الحالية في هذا السحب:</b> <code>{user_tickets_cnt}</code> تذكرة\n"
-        f"👥 <b>إجمالي تذاكر المشاركين:</b> <code>{total_tickets_cnt}</code> تذكرة\n"
-        f"💰 <b>سعر التذكرة الواحدة:</b> <code>{TICKET_PRICE:,}</code> غرام\n"
-        f"💳 <b>رصيدك المتاح:</b> <code>{balance:,}</code> غرام\n"
+    text = get_text(
+        lang,
+        "raffle_menu",
+        prize_pool=draw.prize_pool,
+        user_tickets=user_tickets_cnt,
+        total_tickets=total_tickets_cnt,
+        ticket_price=TICKET_PRICE,
+        balance=balance,
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("🎫 شراء تذكرة واحدة (100 غرام)", callback_data="buy_raffle_1"),
-            InlineKeyboardButton("🎟️ شراء 5 تذاكر (500 غرام)", callback_data="buy_raffle_5"),
+            InlineKeyboardButton(get_text(lang, "raffle_btn_buy_1"), callback_data="buy_raffle_1"),
+            InlineKeyboardButton(get_text(lang, "raffle_btn_buy_5"), callback_data="buy_raffle_5"),
         ],
-        [InlineKeyboardButton("📜 تذاكري في السحب", callback_data="my_raffle_tickets")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")],
+        [InlineKeyboardButton(get_text(lang, "raffle_btn_my"), callback_data="my_raffle_tickets")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")],
     ]
     if is_admin_user(user_id):
         keyboard.append(
-            [InlineKeyboardButton("🎲 إعلان الفائز والسحب الآن (أدمن)", callback_data="admin_draw_raffle_now")]
+            [
+                InlineKeyboardButton(
+                    get_text(lang, "raffle_btn_admin_draw"), callback_data="admin_draw_raffle_now"
+                )
+            ]
         )
 
     markup = InlineKeyboardMarkup(keyboard)
@@ -93,15 +101,16 @@ async def show_raffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_buy_raffle_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     count = int(query.data.replace("buy_raffle_", ""))
     if count <= 0 or count > 100:
-        await query.answer("❌ عدد التذاكر غير صالح.", show_alert=True)
+        await query.answer(get_text(lang, "raffle_err_invalid_qty"), show_alert=True)
         return
     total_cost = count * TICKET_PRICE
 
@@ -111,9 +120,10 @@ async def handle_buy_raffle_tickets(update: Update, context: ContextTypes.DEFAUL
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user or user.balance < total_cost:
-                await query.answer("❌ رصيدك الحالي غير كافٍ لشراء التذاكر!", show_alert=True)
+                await query.answer(get_text(lang, "raffle_err_insufficient"), show_alert=True)
                 return
 
+            lang = get_user_lang(user)
             draw = await get_or_create_active_draw(session)
 
             user.balance -= total_cost
@@ -133,17 +143,18 @@ async def handle_buy_raffle_tickets(update: Update, context: ContextTypes.DEFAUL
             )
             await session.commit()
 
-    await query.answer(f"🎉 تم شراء {count} تذكرة يانصيب بنجاح!", show_alert=True)
+    await query.answer(get_text(lang, "raffle_buy_success", count=count), show_alert=True)
     await show_raffle_menu(update, context)
 
 
 async def show_my_raffle_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     await query.answer()
 
     async with AsyncSessionLocal() as session:
@@ -157,16 +168,18 @@ async def show_my_raffle_tickets(update: Update, context: ContextTypes.DEFAULT_T
         ).scalars().all()
 
     if not tickets:
-        text = "🎫 <b>تذاكري في السحب الحالي:</b>\n\nلم تقم بشراء أي تذاكر في السحب الحالي بعد."
+        text = get_text(lang, "raffle_my_empty")
     else:
         codes_str = ", ".join([f"<code>{t.ticket_code}</code>" for t in tickets[:20]])
-        text = (
-            f"🎫 <b>تذاكرك الحالية (#Draw-{draw.id}):</b>\n\n"
-            f"إجمالي عدد تذاكرك: <code>{len(tickets)}</code>\n"
-            f"أكواد التذاكر:\n{codes_str}"
+        text = get_text(
+            lang,
+            "raffle_my_list",
+            draw_id=draw.id,
+            count=len(tickets),
+            codes=codes_str,
         )
 
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_raffle_menu")]]
+    keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="show_raffle_menu")]]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -176,13 +189,20 @@ async def handle_admin_draw_raffle(update: Update, context: ContextTypes.DEFAULT
     if not is_admin_user(user_id, context.bot, "admin_draw_raffle_now"):
         return
 
+    winner_lang = "ar"
+    admin_lang = "ar"
     async with user_lock_manager.get_lock("raffle_draw"):
         async with AsyncSessionLocal() as session:
+            admin_user = (
+                await session.execute(select(User).where(User.telegram_id == user_id))
+            ).scalar_one_or_none()
+            admin_lang = get_user_lang(admin_user)
+
             draw = (
                 await session.execute(select(RaffleDraw).where(RaffleDraw.status == "active"))
             ).scalar_one_or_none()
             if not draw or draw.prize_pool == 0:
-                await query.answer("❌ لا يوجد سحب نشط أو لا توجد تذاكر مشاركة بعد!", show_alert=True)
+                await query.answer(get_text(admin_lang, "raffle_draw_empty"), show_alert=True)
                 return
 
             all_tickets = (
@@ -191,7 +211,7 @@ async def handle_admin_draw_raffle(update: Update, context: ContextTypes.DEFAULT
                 )
             ).scalars().all()
             if not all_tickets:
-                await query.answer("❌ لم يقم أحد بشراء تذاكر في هذا السحب بعد.", show_alert=True)
+                await query.answer(get_text(admin_lang, "raffle_draw_no_tickets"), show_alert=True)
                 return
 
             winner_ticket = random.choice(all_tickets)
@@ -207,6 +227,7 @@ async def handle_admin_draw_raffle(update: Update, context: ContextTypes.DEFAULT
             draw.drawn_at = utcnow()
 
             if winner_user:
+                winner_lang = get_user_lang(winner_user)
                 winner_user.balance += draw.prize_pool
                 session.add(
                     Transaction(
@@ -224,21 +245,21 @@ async def handle_admin_draw_raffle(update: Update, context: ContextTypes.DEFAULT
             session.add(RaffleDraw(prize_pool=0, status="active"))
             await session.commit()
 
-    await query.answer("🎲 تم السحب وإعلان الفائز بنجاح!", show_alert=True)
+    await query.answer(get_text(admin_lang, "raffle_draw_done_alert"), show_alert=True)
 
-    win_msg = (
-        f"🎉 <b>مبروك للفائز بسحب اليانصيب الأسبوعي!</b> 🎉\n\n"
-        f"🏆 <b>الجائزة الكبرى:</b> <code>+{prize:,}</code> غرام!\n"
-        f"👤 <b>الفائز:</b> <code>{winner_id}</code>\n"
-        f"🎫 <b>رقم التذكرة الفائزة:</b> <code>{t_code}</code>\n\n"
-        f"تم السحب عشوائياً بنجاح وإضافة الجائزة إلى رصيد الفائز. تم بدء سحب أسبوعي جديد الآن! 🚀"
+    win_msg = get_text(
+        admin_lang,
+        "raffle_draw_summary",
+        prize=prize,
+        winner_id=winner_id,
+        ticket_code=t_code,
     )
     await query.edit_message_text(win_msg, parse_mode="HTML")
 
     try:
         await context.bot.send_message(
             chat_id=winner_id,
-            text=f"🥳 <b>مبروك! فزت بالسحب الأسبوعي لليانصيب!</b>\nتم إضافة <b>+{prize:,} غرام</b> إلى حسابك!",
+            text=get_text(winner_lang, "raffle_winner_dm", prize=prize),
             parse_mode="HTML",
         )
     except Exception:

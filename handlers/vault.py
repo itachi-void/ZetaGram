@@ -8,6 +8,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, VaultDeposit, Transaction
 from utils.security import user_lock_manager, sanitize_amount, get_vip_perks
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang, get_vip_title
 from utils.html_utils import esc, utcnow
 
 PLAN_YIELDS = {
@@ -17,12 +18,13 @@ PLAN_YIELDS = {
 
 
 async def show_vault_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     if query:
         await query.answer()
 
@@ -30,6 +32,8 @@ async def show_vault_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = (
             await session.execute(select(User).where(User.telegram_id == user_id))
         ).scalar_one_or_none()
+        if user:
+            lang = get_user_lang(user)
         balance = user.balance if user else 0
         vip_level = user.vip_level if user else 1
 
@@ -42,27 +46,27 @@ async def show_vault_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).scalar() or 0
 
     perks = get_vip_perks(vip_level)
+    level_title = get_vip_title(lang, vip_level)
     bonus_pct = round(perks["vault_bonus"] * 100, 1)
 
-    text = (
-        f"🏛️ <b>خزنة التوفير والأرباح (Savings Vault):</b>\n\n"
-        f"جمّد غراماتك في الخزنة واحصل على عوائد مجانية مضافة لرصيدك!\n\n"
-        f"💳 <b>رصيدك المتاح:</b> <code>{balance:,}</code> غرام\n"
-        f"📦 <b>الودائع النشطة:</b> <code>{active_count}/{MAX_ACTIVE_VAULT_DEPOSITS}</code>\n"
-        f"🏅 <b>عائد إضافي لمستواك ({esc(perks['title'])}):</b> <code>+{bonus_pct}%</code>\n\n"
-        f"📈 <b>خطط الاستثمار المتاحة:</b>\n"
-        f"1️⃣ <b>خطة 7 أيام:</b> عائد أساسي <b>+5%</b> (+ عائد VIP).\n"
-        f"2️⃣ <b>خطة 30 يوم:</b> عائد أساسي <b>+20%</b> (+ عائد VIP).\n"
-        f"🔒 الحد الأقصى للإيداع الواحد: <code>{MAX_VAULT_DEPOSIT:,}</code> غرام."
+    text = get_text(
+        lang,
+        "vault_menu",
+        balance=balance,
+        active_count=active_count,
+        max_active=MAX_ACTIVE_VAULT_DEPOSITS,
+        level_title=esc(level_title),
+        bonus_pct=bonus_pct,
+        max_deposit=MAX_VAULT_DEPOSIT,
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("➕ إيداع 7 أيام (+5%)", callback_data="vault_deposit_7"),
-            InlineKeyboardButton("➕ إيداع 30 يوم (+20%)", callback_data="vault_deposit_30"),
+            InlineKeyboardButton(get_text(lang, "vault_btn_7d"), callback_data="vault_deposit_7"),
+            InlineKeyboardButton(get_text(lang, "vault_btn_30d"), callback_data="vault_deposit_30"),
         ],
-        [InlineKeyboardButton("📜 ودائعي واسترداد الأرباح", callback_data="my_vault_deposits")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")],
+        [InlineKeyboardButton(get_text(lang, "vault_btn_my"), callback_data="my_vault_deposits")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -73,35 +77,41 @@ async def show_vault_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def prompt_vault_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     await query.answer()
+    lang = get_user_lang(db_user)
     days = int(query.data.replace("vault_deposit_", ""))
     context.user_data["vault_plan_days"] = days
     context.user_data["awaiting_vault_amount"] = True
 
     rate_pct = int(PLAN_YIELDS.get(days, 0.05) * 100)
     await query.edit_message_text(
-        f"➕ <b>إنشاء إيداع جديد ({days} يوم - عائد أساسي +{rate_pct}%):</b>\n\n"
-        f"يرجى إرسال مبلغ الغرامات المراد تجميده في الشات مباشرة "
-        f"(الحد الأدنى: 500، الحد الأقصى: {MAX_VAULT_DEPOSIT:,} غرام).",
+        get_text(
+            lang,
+            "vault_prompt",
+            days=days,
+            rate_pct=rate_pct,
+            max_deposit=MAX_VAULT_DEPOSIT,
+        ),
         parse_mode="HTML",
     )
 
 
 async def process_vault_deposit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     text = update.message.text.strip()
     days = context.user_data.get("vault_plan_days", 7)
 
-    ok_amt, amount, err = sanitize_amount(text, min_val=500, max_val=MAX_VAULT_DEPOSIT)
+    ok_amt, amount, err = sanitize_amount(text, min_val=500, max_val=MAX_VAULT_DEPOSIT, lang=lang)
     if not ok_amt:
         await update.message.reply_text(err)
         return True
@@ -117,9 +127,10 @@ async def process_vault_deposit_input(update: Update, context: ContextTypes.DEFA
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user or user.balance < amount:
-                await update.message.reply_text("❌ رصيدك الحالي غير كافٍ لإتمام هذا الإيداع.")
+                await update.message.reply_text(get_text(lang, "vault_err_insufficient"))
                 return True
 
+            lang = get_user_lang(user)
             active_count = (
                 await session.execute(
                     select(func.count(VaultDeposit.id)).where(
@@ -129,7 +140,7 @@ async def process_vault_deposit_input(update: Update, context: ContextTypes.DEFA
             ).scalar() or 0
             if active_count >= MAX_ACTIVE_VAULT_DEPOSITS:
                 await update.message.reply_text(
-                    f"⚠️ وصلت للحد الأقصى للودائع النشطة ({MAX_ACTIVE_VAULT_DEPOSITS}). انتظر فك وديعة قبل إنشاء جديدة."
+                    get_text(lang, "vault_err_max_active", max_active=MAX_ACTIVE_VAULT_DEPOSITS)
                 )
                 return True
 
@@ -158,22 +169,26 @@ async def process_vault_deposit_input(update: Update, context: ContextTypes.DEFA
             await session.commit()
 
     await update.message.reply_text(
-        f"🎉 <b>تم إنشاء الإيداع بنجاح!</b>\n\n"
-        f"💰 <b>المبلغ المجمد:</b> <code>{amount:,}</code> غرام\n"
-        f"📈 <b>الأرباح المتوقعة:</b> <code>+{yield_amount:,}</code> غرام\n"
-        f"⏱️ <b>تاريخ الفك والتصفية:</b> <code>{lock_until.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+        get_text(
+            lang,
+            "vault_deposit_created",
+            amount=amount,
+            yield_amount=yield_amount,
+            lock_until=lock_until.strftime("%Y-%m-%d %H:%M UTC"),
+        ),
         parse_mode="HTML",
     )
     return True
 
 
 async def show_my_vault_deposits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     if query:
         await query.answer()
 
@@ -189,33 +204,48 @@ async def show_my_vault_deposits(update: Update, context: ContextTypes.DEFAULT_T
         ).scalars().all()
 
     if not deposits:
-        text = "🏛️ <b>ودائعي في الخزنة:</b>\n\nلا توجد لديك أي ودائع حالياً."
-        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_vault_menu")]]
+        text = get_text(lang, "vault_my_empty")
+        keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="show_vault_menu")]]
     else:
-        text = "🏛️ <b>ودائعي في الخزنة:</b>\n\n"
+        text = get_text(lang, "vault_my_header")
         keyboard = []
         for d in deposits:
             if d.status == "withdrawn":
-                text += f"✅ <b>إيداع منتهي #{d.id}</b> ({d.duration_days} يوم)\n المبلغ: <code>{d.amount:,}</code> + أرباح <code>{d.yield_amount:,}</code> غرام\n\n"
+                text += get_text(
+                    lang,
+                    "vault_row_withdrawn",
+                    dep_id=d.id,
+                    days=d.duration_days,
+                    amount=d.amount,
+                    yield_amount=d.yield_amount,
+                )
             else:
                 is_matured = now >= d.lock_until
                 status_str = (
-                    "🟢 جاهز للاسترداد"
+                    get_text(lang, "vault_status_ready")
                     if is_matured
-                    else f"⏳ متبقي حتى {d.lock_until.strftime('%Y-%m-%d')}"
+                    else get_text(lang, "vault_status_locked", date=d.lock_until.strftime("%Y-%m-%d"))
                 )
-                text += f"🔹 <b>إيداع #{d.id}</b> ({d.duration_days} يوم) | {status_str}\n المبلغ: <code>{d.amount:,}</code> | الأرباح: <code>+{d.yield_amount:,}</code> غرام\n\n"
+                text += get_text(
+                    lang,
+                    "vault_row_active",
+                    dep_id=d.id,
+                    days=d.duration_days,
+                    status=status_str,
+                    amount=d.amount,
+                    yield_amount=d.yield_amount,
+                )
                 if is_matured:
                     keyboard.append(
                         [
                             InlineKeyboardButton(
-                                f"🎁 استرداد إيداع #{d.id} مع الأرباح",
+                                get_text(lang, "vault_btn_withdraw", dep_id=d.id),
                                 callback_data=f"withdraw_vault_{d.id}",
                             )
                         ]
                     )
 
-        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="show_vault_menu")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="show_vault_menu")])
 
     markup = InlineKeyboardMarkup(keyboard)
     if query:
@@ -225,12 +255,13 @@ async def show_my_vault_deposits(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_withdraw_vault(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     deposit_id = int(query.data.replace("withdraw_vault_", ""))
     now = utcnow()
 
@@ -240,11 +271,11 @@ async def handle_withdraw_vault(update: Update, context: ContextTypes.DEFAULT_TY
                 await session.execute(select(VaultDeposit).where(VaultDeposit.id == deposit_id))
             ).scalar_one_or_none()
             if not dep or dep.user_id != user_id or dep.status != "active":
-                await query.answer("❌ تعذر العثور على هذا الإيداع أو تم استرداده مسبقاً.", show_alert=True)
+                await query.answer(get_text(lang, "vault_err_not_found"), show_alert=True)
                 return
 
             if now < dep.lock_until:
-                await query.answer("⏳ لم ينتهي وقت التجميد بعد!", show_alert=True)
+                await query.answer(get_text(lang, "vault_err_not_matured"), show_alert=True)
                 return
 
             total_payout = dep.amount + dep.yield_amount
@@ -252,6 +283,7 @@ async def handle_withdraw_vault(update: Update, context: ContextTypes.DEFAULT_TY
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if user:
+                lang = get_user_lang(user)
                 user.balance += total_payout
 
             dep.status = "withdrawn"
@@ -265,5 +297,7 @@ async def handle_withdraw_vault(update: Update, context: ContextTypes.DEFAULT_TY
             )
             await session.commit()
 
-    await query.answer(f"🎉 تم استرداد +{total_payout:,} غرام إلى رصيدك بنجاح!", show_alert=True)
+    await query.answer(
+        get_text(lang, "vault_withdrawn_alert", total_payout=total_payout), show_alert=True
+    )
     await show_my_vault_deposits(update, context)

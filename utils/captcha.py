@@ -87,7 +87,7 @@ def generate_image_captcha(lang: str = "ar") -> Tuple[io.BytesIO, int, List[int]
     return buf, answer, options, caption
 
 
-def build_captcha_markup(options: List[int]) -> InlineKeyboardMarkup:
+def build_captcha_markup(options: List[int], lang: str = "ar") -> InlineKeyboardMarkup:
     keyboard = []
     row = []
     for opt in options:
@@ -97,7 +97,9 @@ def build_captcha_markup(options: List[int]) -> InlineKeyboardMarkup:
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔄 تحديث الصورة", callback_data="captcha_refresh")])
+    keyboard.append(
+        [InlineKeyboardButton(get_text(lang, "captcha_btn_refresh"), callback_data="captcha_refresh")]
+    )
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -117,7 +119,9 @@ async def send_captcha_challenge(
         lock_msg = get_text(lang, "captcha_locked", mins=mins)
         if update.callback_query:
             try:
-                await update.callback_query.answer("⛔ محاولات الكابتشا مقفلة مؤقتاً.", show_alert=True)
+                await update.callback_query.answer(
+                    get_text(lang, "captcha_locked_alert"), show_alert=True
+                )
             except Exception:
                 pass
         await context.bot.send_message(chat_id=user_id, text=lock_msg, parse_mode="HTML")
@@ -127,7 +131,7 @@ async def send_captcha_challenge(
     context.user_data["captcha_answer"] = int(answer)
     context.user_data["captcha_expires_at"] = float(time.time() + CAPTCHA_TTL_SECONDS)
 
-    markup = build_captcha_markup(options)
+    markup = build_captcha_markup(options, lang=lang)
     if update.callback_query:
         try:
             await update.callback_query.answer()

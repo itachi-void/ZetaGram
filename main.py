@@ -1,3 +1,4 @@
+import os
 import logging
 import asyncio
 from telegram import Update
@@ -8,10 +9,12 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     PreCheckoutQueryHandler,
+    MessageReactionHandler,
     PicklePersistence,
     filters,
     ContextTypes,
 )
+from sqlalchemy import select
 
 from config import (
     BOT_TOKEN,
@@ -20,7 +23,8 @@ from config import (
     WEBHOOK_PORT,
     WEBHOOK_SECRET_TOKEN,
 )
-from database.db import init_db
+from database.db import init_db, AsyncSessionLocal
+from database.models import User
 from handlers.start import (
     start_command,
     handle_captcha_callback,
@@ -47,6 +51,7 @@ from handlers.task_actions import (
     report_issue_callback,
     process_report_reason_input,
 )
+from handlers.reactions import handle_message_reaction_update
 from handlers.account import show_account_info
 from handlers.promotion import (
     show_promotion_menu,
@@ -60,6 +65,9 @@ from handlers.promotion import (
     process_promo_qty_text_input,
     process_qty_input,
     prompt_target_chat_picker,
+    prompt_promo_code_callback,
+    clear_promo_code_callback,
+    process_promo_code_input,
     handle_stars_fee_free_payment,
     handle_pre_checkout,
     handle_successful_payment,
@@ -147,6 +155,11 @@ from handlers.admin import (
     admin_broadcast_help,
     handle_broadcast_command,
     add_task_admin,
+    admin_promos_menu,
+    handle_add_promo_command,
+    handle_flash_event_command,
+    handle_stop_flash_command,
+    handle_admin_promo_callbacks,
 )
 from utils.gatekeeper import enforce_user_access, clear_user_input_states
 from utils.anti_unsub_checker import run_anti_unsub_checker
@@ -157,7 +170,7 @@ from utils.scheduled_tasks import (
     run_proof_auto_approve_worker,
     run_weekly_leaderboard_worker,
 )
-from utils.i18n import TEXTS
+from utils.i18n import TEXTS, get_text, get_user_lang
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -282,6 +295,10 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         if await process_promo_qty_text_input(update, context):
             return
 
+    if context.user_data.get("awaiting_promo_code"):
+        if await process_promo_code_input(update, context):
+            return
+
     if context.user_data.get("awaiting_promo_target"):
         if await process_promo_target_input(update, context):
             return
@@ -359,7 +376,13 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "tasks_premium":
         is_premium = getattr(update.effective_user, "is_premium", False)
         if not is_premium:
-            await query.answer("⚡ فئة الشحن متاحة فقط لمستخدمي Telegram Premium", show_alert=True)
+            lang = "ar"
+            async with AsyncSessionLocal() as s:
+                u = (
+                    await s.execute(select(User).where(User.telegram_id == update.effective_user.id))
+                ).scalar_one_or_none()
+                lang = get_user_lang(u)
+            await query.answer(get_text(lang, "premium_only_alert"), show_alert=True)
         else:
             await handle_task_list(update, context, "premium")
     elif data in (
@@ -417,6 +440,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_qty_input(update, context, qty)
     elif data == "pay_method_gram":
         await prompt_target_chat_picker(update, context)
+    elif data == "promo_enter_code":
+        await prompt_promo_code_callback(update, context)
+    elif data == "promo_clear_code":
+        await clear_promo_code_callback(update, context)
     elif data == "pay_method_stars":
         await handle_stars_fee_free_payment(update, context)
     elif data == "promo_confirm_create":
@@ -508,6 +535,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_reports_manage(update, context)
     elif data.startswith("admin_report_"):
         await handle_admin_report_action(update, context)
+    elif data == "admin_promos_menu":
+        await admin_promos_menu(update, context)
+    elif data.startswith(("admin_stop_flash_", "admin_notify_flash_", "admin_toggle_promo_")):
+        await handle_admin_promo_callbacks(update, context)
     elif data == "admin_broadcast_help":
         await admin_broadcast_help(update, context)
     elif data == "admin_mand_subs_view":
@@ -547,6 +578,9 @@ def main():
     app.add_handler(CommandHandler("language", show_language_menu))
     app.add_handler(CommandHandler("admin", show_admin_panel))
     app.add_handler(CommandHandler("addtask", add_task_admin))
+    app.add_handler(CommandHandler("addpromo", handle_add_promo_command))
+    app.add_handler(CommandHandler("flash", handle_flash_event_command))
+    app.add_handler(CommandHandler("stopflash", handle_stop_flash_command))
     app.add_handler(CommandHandler("transfer", handle_transfer_command))
     app.add_handler(CommandHandler("createvoucher", handle_create_voucher_command))
     app.add_handler(CommandHandler("setbalance", handle_setbalance_command))
@@ -558,6 +592,9 @@ def main():
     app.add_handler(CommandHandler("raffle", show_raffle_menu))
     app.add_handler(CommandHandler("leaderboard", show_leaderboard))
     app.add_handler(CommandHandler("settings", show_user_settings))
+
+    # Automatic Message Reaction Verification (channels/groups where bot is admin)
+    app.add_handler(MessageReactionHandler(handle_message_reaction_update))
 
     # Payments & Native Chat Sharing
     app.add_handler(PreCheckoutQueryHandler(handle_pre_checkout))
@@ -580,9 +617,10 @@ def main():
             url_path="webhook",
             webhook_url=WEBHOOK_URL,
             secret_token=WEBHOOK_SECRET_TOKEN or None,
+            allowed_updates=Update.ALL_TYPES,
         )
     else:
-        app.run_polling()
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

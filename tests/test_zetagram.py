@@ -3,6 +3,7 @@ import os
 import re
 import ast
 import time
+import string
 import asyncio
 import sqlite3
 import py_compile
@@ -14,6 +15,7 @@ import pytest
 import pytest_asyncio
 from PIL import Image, ImageDraw
 from sqlalchemy import select, text
+from telegram import ReactionTypeEmoji
 
 import config
 from database.db import configure_db, init_db, migrate_sqlite_columns, create_safe_sqlite_backup, AsyncSessionLocal
@@ -29,12 +31,18 @@ from database.models import (
     DisputeTicket,
     SkippedTask,
     TaskReport,
+    PromoCode,
+    PromoCodeRedemption,
+    FlashEvent,
 )
 from utils.captcha import generate_image_captcha
 from utils.image_hash import compute_dhash, is_similar_hash
 from utils.security import rate_limiter
 from utils.gatekeeper import reset_gatekeeper_caches
 from utils.anti_unsub_checker import check_unsubs_once
+from utils.telegram_api import parse_telegram_post_link
+from utils.promotions import validate_promo_code
+from utils.i18n import TEXTS
 from utils.scheduled_tasks import (
     compile_and_send_daily_report_once,
     run_retention_reminders_once,
@@ -54,11 +62,26 @@ from handlers.task_actions import (
     claim_post_callback,
     handle_bot_forward_message,
 )
+from handlers.reactions import handle_message_reaction_update
 from handlers.proof_review import (
     process_proof_photo,
     handle_worker_dispute_callbacks,
 )
-from handlers.promotion import mytask_action_callback
+from handlers.promotion import (
+    mytask_action_callback,
+    promo_confirm_create_callback,
+    process_promo_code_input,
+    show_promotion_menu,
+)
+from handlers.earnings import show_earnings_menu
+from handlers.account import show_account_info
+from handlers.leaderboard import show_leaderboard
+from handlers.settings import show_user_settings
+from handlers.admin import (
+    handle_add_promo_command,
+    handle_flash_event_command,
+    handle_stop_flash_command,
+)
 from handlers.dynamic_subs import prompt_add_mandatory_channel
 import main as bot_main
 
@@ -181,7 +204,16 @@ async def test_db_wal_migration_and_backup(tmp_path):
     check_conn.close()
 
     assert {"trust_score", "daily_streak", "tasks_since_captcha", "fee_free_until", "daily_quest_date"} <= user_cols
-    assert {"escrow_balance", "target_languages", "requires_premium", "bot_username"} <= task_cols
+    assert {
+        "escrow_balance",
+        "target_languages",
+        "requires_premium",
+        "bot_username",
+        "target_message_id",
+        "auto_verify_reactions",
+        "promo_code_used",
+        "promo_subsidy",
+    } <= task_cols
     assert {"proof_file_unique_id", "proof_phash", "submitted_at", "reward_paid"} <= ut_cols
 
     backup_file = tmp_path / "backup_copy.db"
@@ -761,6 +793,356 @@ async def test_weekly_leaderboard_payout_and_idempotency(temp_db):
         assert u901.balance == 3000
 
 
+@pytest.mark.asyncio
+async def test_auto_reaction_verification_and_link_parsing(temp_db):
+    assert parse_telegram_post_link("https://t.me/my_channel/42?single") == ("@my_channel", 42)
+    assert parse_telegram_post_link("https://t.me/c/123456789/99") == ("-100123456789", 99)
+    assert parse_telegram_post_link("https://t.me/+InviteHashHere") == (None, None)
+
+    async with AsyncSessionLocal() as session:
+        session.add(User(telegram_id=1101, first_name="Reactor", balance=0, language="en", is_captcha_verified=True))
+        session.add(User(telegram_id=1102, first_name="Unverified", balance=0, is_captcha_verified=False))
+        session.add(User(telegram_id=1103, first_name="Banned", balance=0, is_captcha_verified=True, banned_until=utcnow() + timedelta(days=1)))
+        t_fixed = Task(
+            title="FixedHeartPost",
+            task_type="reaction_fixed",
+            target_url="https://t.me/my_channel/42",
+            chat_id="-100123456",
+            target_message_id=42,
+            auto_verify_reactions=True,
+            required_emoji="❤️",
+            reward_grams=250,
+            total_qty=5,
+            completed_qty=0,
+            escrow_balance=1250,
+            status="active",
+            created_by=9999,
+        )
+        t_random = Task(
+            title="AnyEmojiPost",
+            task_type="reaction_random",
+            target_url="https://t.me/my_channel/43",
+            chat_id="@my_channel",
+            target_message_id=43,
+            auto_verify_reactions=True,
+            reward_grams=150,
+            total_qty=5,
+            completed_qty=0,
+            escrow_balance=750,
+            status="active",
+            created_by=9999,
+        )
+        session.add_all([t_fixed, t_random])
+        await session.commit()
+        tf_id, tr_id = t_fixed.id, t_random.id
+
+    bot = _make_mock_bot()
+    ctx = _make_context(bot)
+
+    def _make_rx_update(uid: int, chat_id: int, username: str | None, msg_id: int, new_rx, old_rx=None, is_bot: bool = False):
+        upd = MagicMock()
+        upd.message_reaction = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id, username=username),
+            message_id=msg_id,
+            user=SimpleNamespace(id=uid, is_bot=is_bot, is_premium=False),
+            new_reaction=new_rx or [],
+            old_reaction=old_rx or [],
+        )
+        return upd
+
+    # 1. Removing reaction does not award
+    assert await handle_message_reaction_update(
+        _make_rx_update(1101, -100123456, "my_channel", 42, [], [ReactionTypeEmoji("❤️")]), ctx
+    ) == 0
+
+    # 2. Wrong emoji for reaction_fixed does not award
+    assert await handle_message_reaction_update(
+        _make_rx_update(1101, -100123456, "my_channel", 42, [ReactionTypeEmoji("👍")]), ctx
+    ) == 0
+
+    # 3. Matching emoji (without FE0F variation selector) pays immediately
+    assert await handle_message_reaction_update(
+        _make_rx_update(1101, -100123456, "my_channel", 42, [ReactionTypeEmoji("❤")]), ctx
+    ) == 1
+
+    # 4. Duplicate reaction on same message does not double-pay
+    assert await handle_message_reaction_update(
+        _make_rx_update(1101, -100123456, "my_channel", 42, [ReactionTypeEmoji("❤"), ReactionTypeEmoji("🔥")], [ReactionTypeEmoji("❤")]), ctx
+    ) == 0
+
+    # 5. Unverified or banned user cannot claim
+    assert await handle_message_reaction_update(
+        _make_rx_update(1102, -100123456, "my_channel", 42, [ReactionTypeEmoji("❤️")]), ctx
+    ) == 0
+    assert await handle_message_reaction_update(
+        _make_rx_update(1103, -100123456, "my_channel", 42, [ReactionTypeEmoji("❤️")]), ctx
+    ) == 0
+
+    # 6. reaction_random via @username matching pays any emoji
+    assert await handle_message_reaction_update(
+        _make_rx_update(1101, -100999999, "my_channel", 43, [ReactionTypeEmoji("🔥")]), ctx
+    ) == 1
+
+    async with AsyncSessionLocal() as session:
+        u1101 = (await session.execute(select(User).where(User.telegram_id == 1101))).scalar_one()
+        tf = (await session.execute(select(Task).where(Task.id == tf_id))).scalar_one()
+        tr = (await session.execute(select(Task).where(Task.id == tr_id))).scalar_one()
+        assert u1101.balance == 400
+        assert tf.completed_qty == 1 and tf.escrow_balance == 1000
+        assert tr.completed_qty == 1 and tr.escrow_balance == 600
+    # Worker 1101 prefers English: verify notification had no Arabic chars
+    assert any("Auto-Verified" in str(c) for c in bot.send_message.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_promo_codes_discounts_race_and_no_arbitrage(temp_db):
+    admin_id = config.ADMIN_IDS[0]
+    async with AsyncSessionLocal() as session:
+        session.add(User(telegram_id=1201, first_name="Adv1", balance=50_000, vip_level=1, is_captcha_verified=True))
+        session.add(User(telegram_id=1202, first_name="Adv2", balance=50_000, vip_level=1, is_captcha_verified=True))
+        session.add(
+            PromoCode(
+                code="TOT20",
+                discount_percent=20,
+                discount_scope="total",
+                max_uses=5,
+                used_count=0,
+                min_order_grams=5000,
+                is_active=True,
+            )
+        )
+        session.add(
+            PromoCode(
+                code="ONEONLY",
+                discount_percent=100,
+                discount_scope="commission",
+                max_uses=1,
+                used_count=0,
+                min_order_grams=1000,
+                is_active=True,
+            )
+        )
+        session.add(
+            PromoCode(
+                code="OLDEXP",
+                discount_percent=50,
+                discount_scope="commission",
+                max_uses=10,
+                used_count=0,
+                expires_at=utcnow() - timedelta(hours=1),
+                is_active=True,
+            )
+        )
+        await session.commit()
+
+    # 1. Expired & min-order validation
+    async with AsyncSessionLocal() as session:
+        ok_exp, _, k_exp = await validate_promo_code(session, 1201, "OLDEXP", 10_000)
+        assert not ok_exp and k_exp == "promo_err_expired"
+        ok_min, _, k_min = await validate_promo_code(session, 1201, "TOT20", 3000)
+        assert not ok_min and k_min == "promo_err_min_order"
+
+    # 2. Total-scoped 20% discount -> verify anti-arbitrage cancel refund!
+    # escrow = 10,000, VIP1 fee = 15% (1,500) -> orig_total = 11,500 -> 20% off = 2,300 -> pay = 9,200; subsidy = 800
+    bot = _make_mock_bot()
+    ctx = _make_context(
+        bot,
+        user_data={
+            "promo_category": "post",
+            "task_qty": 10,
+            "unit_price": 1000,
+            "promo_target_url": "https://t.me/chan/10",
+            "promo_title": "TotalPromoCamp",
+            "promo_applied_code": "TOT20",
+        },
+    )
+    await promo_confirm_create_callback(_make_callback_update(1201, "promo_confirm_create"), ctx)
+
+    async with AsyncSessionLocal() as session:
+        adv1 = (await session.execute(select(User).where(User.telegram_id == 1201))).scalar_one()
+        t_tot = (await session.execute(select(Task).where(Task.title == "TotalPromoCamp"))).scalar_one()
+        assert adv1.balance == 50_000 - 9_200
+        assert t_tot.escrow_balance == 10_000
+        assert t_tot.promo_subsidy == 800
+        assert t_tot.promo_code_used == "TOT20"
+        t_tot_id = t_tot.id
+
+    # Duplicate use by same user rejected
+    async with AsyncSessionLocal() as session:
+        ok_dup, _, k_dup = await validate_promo_code(session, 1201, "TOT20", 10_000)
+        assert not ok_dup and k_dup == "promo_err_already_used"
+
+    # Cancelling immediately refunds ONLY net 9,200 (escrow 10,000 - subsidy 800), NOT 10,000!
+    rate_limiter.reset()
+    await mytask_action_callback(_make_callback_update(1201, f"mytask_cancel_{t_tot_id}"), _make_context(bot))
+    async with AsyncSessionLocal() as session:
+        adv1 = (await session.execute(select(User).where(User.telegram_id == 1201))).scalar_one()
+        assert adv1.balance == 50_000
+
+    # 3. Concurrent redemption race on max_uses=1 code ("ONEONLY")
+    ctx_r1 = _make_context(
+        bot,
+        user_data={
+            "promo_category": "post",
+            "task_qty": 10,
+            "unit_price": 1000,
+            "promo_target_url": "https://t.me/chan/11",
+            "promo_title": "RaceCamp1",
+            "promo_applied_code": "ONEONLY",
+        },
+    )
+    ctx_r2 = _make_context(
+        bot,
+        user_data={
+            "promo_category": "post",
+            "task_qty": 10,
+            "unit_price": 1000,
+            "promo_target_url": "https://t.me/chan/12",
+            "promo_title": "RaceCamp2",
+            "promo_applied_code": "ONEONLY",
+        },
+    )
+    rate_limiter.reset()
+    await asyncio.gather(
+        promo_confirm_create_callback(_make_callback_update(1201, "promo_confirm_create"), ctx_r1),
+        promo_confirm_create_callback(_make_callback_update(1202, "promo_confirm_create"), ctx_r2),
+    )
+    async with AsyncSessionLocal() as session:
+        one_promo = (await session.execute(select(PromoCode).where(PromoCode.code == "ONEONLY"))).scalar_one()
+        reds = (await session.execute(select(PromoCodeRedemption).where(PromoCodeRedemption.promo_code_id == one_promo.id))).scalars().all()
+        assert one_promo.used_count == 1
+        assert len(reds) == 1
+
+
+@pytest.mark.asyncio
+async def test_flash_event_multiplier_and_admin_commands(temp_db):
+    admin_id = config.ADMIN_IDS[0]
+    async with AsyncSessionLocal() as session:
+        session.add(User(telegram_id=1301, first_name="FlashWorker", balance=0, vip_level=1, is_captcha_verified=True))
+        session.add(
+            Task(
+                title="FlashTask",
+                task_type="post",
+                target_url="https://t.me/f/1",
+                reward_grams=300,
+                total_qty=10,
+                completed_qty=0,
+                escrow_balance=3000,
+                status="active",
+                created_by=999,
+            )
+        )
+        await session.commit()
+
+    bot = _make_mock_bot()
+    # Admin launches /flash 2 2 Happy Hour
+    await handle_flash_event_command(
+        _make_message_update(admin_id, "/flash 2 2 Happy Hour"),
+        _make_context(bot, args=["2", "2", "Happy", "Hour"]),
+    )
+
+    # Earnings menu renders the live Flash Event banner
+    upd_earn = _make_message_update(1301)
+    await show_earnings_menu(upd_earn, _make_context(bot))
+    assert "Happy Hour" in upd_earn.message.reply_text.call_args.args[0]
+
+    # Completing task during 2x Flash Event pays +100% flash bonus (total 600) while escrow deducts only base 300
+    async with AsyncSessionLocal() as session:
+        w = (await session.execute(select(User).where(User.telegram_id == 1301))).scalar_one()
+        t = (await session.execute(select(Task).where(Task.title == "FlashTask"))).scalar_one()
+        t.completed_qty += 1
+        ut = UserTask(user_id=1301, task_id=t.id, status="completed")
+        session.add(ut)
+        info = await award_task_completion(session, bot, w, t, ut)
+        await session.commit()
+        assert info["flash_bonus"] == 300
+        assert info["total_reward"] == 600
+        assert t.escrow_balance == 2700
+        assert w.balance == 600
+
+    # Admin stops flash event -> next completion pays normal 300
+    await handle_stop_flash_command(_make_message_update(admin_id, "/stopflash"), _make_context(bot))
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Task(
+                title="PostFlashTask",
+                task_type="post",
+                target_url="https://t.me/f/2",
+                reward_grams=300,
+                total_qty=10,
+                completed_qty=0,
+                escrow_balance=3000,
+                status="active",
+                created_by=999,
+            )
+        )
+        await session.commit()
+    async with AsyncSessionLocal() as session:
+        w = (await session.execute(select(User).where(User.telegram_id == 1301))).scalar_one()
+        t2 = (await session.execute(select(Task).where(Task.title == "PostFlashTask"))).scalar_one()
+        t2.completed_qty += 1
+        ut2 = UserTask(user_id=1301, task_id=t2.id, status="completed")
+        session.add(ut2)
+        info2 = await award_task_completion(session, bot, w, t2, ut2)
+        await session.commit()
+        assert info2["flash_bonus"] == 0
+        assert info2["total_reward"] == 300
+        assert w.balance == 900
+
+
+@pytest.mark.asyncio
+async def test_full_i18n_parity_and_multilang_rendering(temp_db):
+    # 1. Parity across ar, en, ru + clean placeholders + no HTML escapes in button texts
+    assert set(TEXTS["ar"]) == set(TEXTS["en"]) == set(TEXTS["ru"])
+    fmt = string.Formatter()
+    for key in TEXTS["ar"]:
+        fields_ar = sorted([f for _, f, _, _ in fmt.parse(TEXTS["ar"][key]) if f is not None])
+        fields_en = sorted([f for _, f, _, _ in fmt.parse(TEXTS["en"][key]) if f is not None])
+        fields_ru = sorted([f for _, f, _, _ in fmt.parse(TEXTS["ru"][key]) if f is not None])
+        assert fields_ar == fields_en == fields_ru, f"Placeholder mismatch for key {key}"
+        assert not any("\u0600" <= c <= "\u06ff" for c in TEXTS["en"][key]), f"Arabic in EN[{key}]"
+        assert not any("\u0600" <= c <= "\u06ff" for c in TEXTS["ru"][key]), f"Arabic in RU[{key}]"
+        if "_btn_" in key or key.startswith("btn_"):
+            assert "&amp;" not in TEXTS["en"][key], f"HTML entity in button EN[{key}]"
+
+    # 2. AST scan verifying every literal key passed to get_text(..., "<key>") exists
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    literal_keys = set()
+    for dirpath, _, filenames in os.walk(root):
+        if any(skip in dirpath for skip in (".venv", "__pycache__", ".git", "tests")):
+            continue
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dirpath, fn)
+            tree = ast.parse(open(p, encoding="utf-8").read(), filename=p)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "get_text":
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                        literal_keys.add(node.args[1].value)
+    missing = literal_keys - set(TEXTS["ar"])
+    assert not missing, f"Missing i18n keys referenced in code: {missing}"
+
+    # 3. Render main screens for 'en' and 'ru' users and verify zero Arabic characters leak
+    async with AsyncSessionLocal() as session:
+        session.add(User(telegram_id=1401, first_name="Alice", balance=5000, language="en", is_captcha_verified=True))
+        session.add(User(telegram_id=1402, first_name="Ivan", balance=5000, language="ru", is_captcha_verified=True))
+        await session.commit()
+
+    bot = _make_mock_bot()
+    for uid, expected_word in [(1401, "Account"), (1402, "профиль")]:
+        for fn in (show_account_info, show_earnings_menu, claim_daily_bonus, show_leaderboard, show_user_settings, show_promotion_menu):
+            rate_limiter.reset()
+            upd = _make_message_update(uid)
+            await fn(upd, _make_context(bot))
+            rendered = upd.message.reply_text.call_args.args[0]
+            assert not any("\u0600" <= c <= "\u06ff" for c in rendered), (
+                f"Arabic leaked in {fn.__name__} for user {uid}: {rendered}"
+            )
+            if fn is show_account_info:
+                assert expected_word in rendered
+
+
 def _collect_main_callback_routes(main_path: str):
     with open(main_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=main_path)
@@ -802,9 +1184,12 @@ def test_static_compile_and_no_dead_callbacks():
     py_files = []
     for folder in ("database", "handlers", "utils"):
         fpath = os.path.join(root, folder)
-        for fn in os.listdir(fpath):
-            if fn.endswith(".py"):
-                py_files.append(os.path.join(fpath, fn))
+        for dirpath, _, filenames in os.walk(fpath):
+            if "__pycache__" in dirpath:
+                continue
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    py_files.append(os.path.join(dirpath, fn))
     py_files.extend([os.path.join(root, "config.py"), os.path.join(root, "main.py")])
 
     for pf in py_files:
@@ -832,3 +1217,8 @@ def test_static_compile_and_no_dead_callbacks():
         unmatched.append(cb)
 
     assert not unmatched, f"Unrouted callback_data prefixes found: {unmatched}"
+
+    main_src = open(os.path.join(root, "main.py"), "r", encoding="utf-8").read()
+    assert "import os" in main_src
+    assert "MessageReactionHandler" in main_src
+    assert "allowed_updates=Update.ALL_TYPES" in main_src

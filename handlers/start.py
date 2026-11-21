@@ -5,7 +5,6 @@ from telegram.ext import ContextTypes
 from sqlalchemy import select
 
 from config import (
-    CAPTCHA_TTL_SECONDS,
     CAPTCHA_MAX_ATTEMPTS,
     CAPTCHA_LOCK_MINUTES,
     REFERRAL_JOIN_BONUS,
@@ -14,6 +13,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, Transaction
 from utils.captcha import send_captcha_challenge
 from utils.security import send_security_alert
+from utils.promotions import get_active_flash_event, format_multiplier
 from utils.i18n import get_text, LANGUAGES
 from utils.html_utils import esc, utcnow
 from handlers.vouchers import redeem_voucher
@@ -47,6 +47,19 @@ def build_language_keyboard():
         keyboard.append(row)
 
     return InlineKeyboardMarkup(keyboard)
+
+
+async def _append_flash_banner_if_live(session, lang: str, base_text: str) -> str:
+    event = await get_active_flash_event(session)
+    if event:
+        base_text += get_text(
+            lang,
+            "welcome_flash_banner",
+            title=esc(event.title),
+            mult=format_multiplier(event.multiplier_pct),
+            ends=event.ends_at.strftime("%Y-%m-%d %H:%M"),
+        )
+    return base_text
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +116,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["pending_voucher_redeem"] = voucher_code
             return
 
-        # Keep username / first_name fresh
         if db_user.username != user.username or db_user.first_name != user.first_name:
             db_user.username = user.username
             db_user.first_name = user.first_name
@@ -138,7 +150,8 @@ async def start_command_after_language(
             )
             return
 
-    welcome_text = get_text(lang, "welcome", name=first_name)
+        welcome_text = get_text(lang, "welcome", name=first_name)
+        welcome_text = await _append_flash_banner_if_live(session, lang, welcome_text)
 
     if update.callback_query:
         await context.bot.send_message(
@@ -192,7 +205,7 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         if user and user.captcha_locked_until and now < user.captcha_locked_until:
             rem_secs = (user.captcha_locked_until - now).total_seconds()
             mins = max(1, int(rem_secs // 60) + 1)
-            await query.answer("⛔ محاولات الكابتشا مقفلة مؤقتاً.", show_alert=True)
+            await query.answer(get_text(lang, "captcha_locked_alert"), show_alert=True)
             await context.bot.send_message(
                 chat_id=user_id,
                 text=get_text(lang, "captcha_locked", mins=mins),
@@ -224,7 +237,7 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
                 await session.commit()
 
         if locked_now:
-            await query.answer("⛔ تم قفل الكابتشا مؤقتاً!", show_alert=True)
+            await query.answer(get_text(lang, "captcha_locked_alert"), show_alert=True)
             try:
                 await query.delete_message()
             except Exception:
@@ -251,7 +264,6 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         await send_captcha_challenge(update, context, lang=lang)
         return
 
-    # Correct Captcha Answer!
     join_bonus_awarded = False
     async with AsyncSessionLocal() as session:
         user = (
@@ -278,6 +290,11 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
 
             await session.commit()
 
+        welcome_text = get_text(lang, "welcome", name=esc(update.effective_user.first_name))
+        if join_bonus_awarded:
+            welcome_text += get_text(lang, "welcome_join_bonus", bonus=REFERRAL_JOIN_BONUS)
+        welcome_text = await _append_flash_banner_if_live(session, lang, welcome_text)
+
     context.user_data.pop("captcha_answer", None)
     context.user_data.pop("captcha_expires_at", None)
 
@@ -286,12 +303,6 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.delete_message()
     except Exception:
         pass
-
-    welcome_text = get_text(lang, "welcome", name=esc(update.effective_user.first_name))
-    if join_bonus_awarded:
-        welcome_text += (
-            f"\n\n🎁 <b>هدية الدعوة:</b> تم إضافة <b>+{REFERRAL_JOIN_BONUS:,} غرام</b> إلى رصيدك فور التفعيل!"
-        )
 
     await context.bot.send_message(
         chat_id=user_id,

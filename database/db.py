@@ -104,6 +104,10 @@ def migrate_sqlite_columns(db_url: str | None = None):
             "commission_paid": "commission_paid INTEGER DEFAULT 0",
             "bot_username": "bot_username VARCHAR(64)",
             "required_emoji": "required_emoji VARCHAR(32)",
+            "target_message_id": "target_message_id BIGINT",
+            "auto_verify_reactions": "auto_verify_reactions BOOLEAN DEFAULT 0",
+            "promo_code_used": "promo_code_used VARCHAR(64)",
+            "promo_subsidy": "promo_subsidy INTEGER DEFAULT 0",
         })
 
         add_missing("user_tasks", {
@@ -125,6 +129,7 @@ def migrate_sqlite_columns(db_url: str | None = None):
             "CREATE INDEX IF NOT EXISTS ix_users_banned_until ON users(banned_until)",
             "CREATE INDEX IF NOT EXISTS ix_tasks_type_status ON tasks(task_type, status)",
             "CREATE INDEX IF NOT EXISTS ix_tasks_created_by ON tasks(created_by)",
+            "CREATE INDEX IF NOT EXISTS ix_tasks_chat_msg ON tasks(chat_id, target_message_id)",
             "CREATE INDEX IF NOT EXISTS ix_ut_user_status ON user_tasks(user_id, status)",
             "CREATE INDEX IF NOT EXISTS ix_ut_task_status ON user_tasks(task_id, status)",
             "CREATE INDEX IF NOT EXISTS ix_user_tasks_proof_file_unique_id ON user_tasks(proof_file_unique_id)",
@@ -133,6 +138,7 @@ def migrate_sqlite_columns(db_url: str | None = None):
             "CREATE INDEX IF NOT EXISTS ix_tx_type_created ON transactions(trans_type, created_at)",
             "CREATE INDEX IF NOT EXISTS ix_dispute_status ON dispute_tickets(status)",
             "CREATE INDEX IF NOT EXISTS ix_task_reports_status ON task_reports(status)",
+            "CREATE INDEX IF NOT EXISTS ix_flash_events_active_window ON flash_events(is_active, starts_at, ends_at)",
         ]
         for idx_sql in regular_indexes:
             try:
@@ -144,6 +150,7 @@ def migrate_sqlite_columns(db_url: str | None = None):
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_task ON user_tasks(user_id, task_id)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_redemption ON voucher_redemptions(voucher_id, user_id)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_dispute_ut ON dispute_tickets(user_task_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_promo_redemption ON promo_code_redemptions(promo_code_id, user_id)",
         ]
         for uidx_sql in unique_indexes:
             try:

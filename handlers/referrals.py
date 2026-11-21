@@ -7,20 +7,21 @@ from config import BOT_NAME, REFERRAL_JOIN_BONUS, REFERRAL_ACTIVE_BONUS
 from database.db import AsyncSessionLocal
 from database.models import User, UserTask, Transaction
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc
 
 
 async def show_referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     bot_info = await context.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
     async with AsyncSessionLocal() as session:
-        # Single aggregated query (eliminates N+1 loop)
         task_counts_sub = (
             select(UserTask.user_id, func.count(UserTask.id).label("cnt"))
             .where(UserTask.status.in_(["completed", "approved"]))
@@ -49,28 +50,25 @@ async def show_referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         ).scalar() or 0
 
-    text = (
-        f"👥 <b>نظام دعوة الأصدقاء والمكافآت ({esc(BOT_NAME)}):</b>\n\n"
-        f"قم بدعوة أصدقائك لاستخدام البوت واكسب مكافآت حقيقية ومستمرة!\n\n"
-        f"📊 <b>إحصائيات إحالاتك:</b>\n"
-        f"• 👥 <b>إجمالي المدعوين:</b> <code>{total_invites}</code> عضو\n"
-        f"• ⚡ <b>الأصدقاء النشطون (أكملوا 3 مهام):</b> <code>{active_invites}</code> عضو\n"
-        f"• 💰 <b>إجمالي أرباحك من الإحالات:</b> <code>{total_earned:,}</code> غرام\n\n"
-        f"🎁 <b>تفاصيل المكافآت:</b>\n"
-        f"• يحصل صديقك على <b>+{REFERRAL_JOIN_BONUS:,} غرام</b> فور الانضمام واجتياز الكابتشا.\n"
-        f"• تحصل أنت على <b>+{REFERRAL_ACTIVE_BONUS:,} غرام</b> فور إكمال صديقك 3 مهام.\n"
-        f"• وتحصل على <b>10% عمولة دائمة</b> من أرباح أصدقائك في كل مهمة!\n\n"
-        f"🔗 <b>رابط الدعوة الخاص بك:</b>\n"
-        f"<code>{esc(ref_link)}</code>"
+    text = get_text(
+        lang,
+        "ref_menu",
+        bot_name=esc(BOT_NAME),
+        total_invites=total_invites,
+        active_invites=active_invites,
+        total_earned=total_earned,
+        join_bonus=REFERRAL_JOIN_BONUS,
+        active_bonus=REFERRAL_ACTIVE_BONUS,
+        ref_link=esc(ref_link),
     )
 
-    share_text = quote(f"اشترك في بوت {BOT_NAME} لكسب الغرامات وترويج القنوات والمجموعات!")
+    share_text = quote(get_text(lang, "ref_share_text", bot_name=BOT_NAME))
     share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={share_text}"
 
     keyboard = [
-        [InlineKeyboardButton("📤 مشاركة رابط الدعوة", url=share_url)],
-        [InlineKeyboardButton("👥 قائمة المدعوين", callback_data="my_referrals_list")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")],
+        [InlineKeyboardButton(get_text(lang, "ref_btn_share"), url=share_url)],
+        [InlineKeyboardButton(get_text(lang, "ref_btn_list"), callback_data="my_referrals_list")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")],
     ]
 
     markup = InlineKeyboardMarkup(keyboard)
@@ -86,13 +84,14 @@ async def show_referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_referrals_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
 
     async with AsyncSessionLocal() as session:
         task_counts_sub = (
@@ -117,13 +116,17 @@ async def show_referrals_list(update: Update, context: ContextTypes.DEFAULT_TYPE
         ).all()
 
     if not rows:
-        text = "👥 <b>قائمة المدعوين:</b>\n\nلم يقم أحد بالانضمام عبر رابطك بعد. انشر رابطك واكسب المكافآت!"
+        text = get_text(lang, "ref_list_empty")
     else:
-        text = f"👥 <b>قائمة الأعضاء المدعوين ({len(rows)}):</b>\n\n"
+        text = get_text(lang, "ref_list_title", count=len(rows))
         for idx, (uid, fname, uname, task_cnt) in enumerate(rows, start=1):
             name = esc(fname or uname or f"User {uid}")
-            status_icon = "✅ (نشط)" if task_cnt >= 3 else f"⌛ ({task_cnt}/3 مهام)"
-            text += f"{idx}. {name} — {status_icon}\n"
+            status_str = (
+                get_text(lang, "ref_status_active")
+                if task_cnt >= 3
+                else get_text(lang, "ref_status_pending", cnt=task_cnt)
+            )
+            text += f"{idx}. {name} — {status_str}\n"
 
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_referral_main")]]
+    keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="show_referral_main")]]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))

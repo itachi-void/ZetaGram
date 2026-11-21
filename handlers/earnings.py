@@ -6,11 +6,14 @@ from sqlalchemy import select, and_
 from database.db import AsyncSessionLocal
 from database.models import Task, UserTask, SkippedTask
 from utils.gatekeeper import enforce_user_access
+from utils.promotions import get_active_flash_event, format_multiplier
+from utils.i18n import get_text, get_user_lang
+from utils.html_utils import esc
 
 
 async def _get_available_counts_for_user(
     user_id: int, user_lang: str, is_premium: bool
-) -> Counter:
+) -> tuple[Counter, object]:
     async with AsyncSessionLocal() as session:
         completed_ids = [
             r[0]
@@ -39,6 +42,7 @@ async def _get_available_counts_for_user(
             )
         )
         tasks = (await session.execute(stmt)).scalars().all()
+        flash_event = await get_active_flash_event(session)
 
     counts = Counter()
     for t in tasks:
@@ -49,7 +53,7 @@ async def _get_available_counts_for_user(
             if allowed and user_lang not in allowed:
                 continue
         counts[t.task_type] += 1
-    return counts
+    return counts, flash_event
 
 
 async def show_earnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,10 +62,10 @@ async def show_earnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user_id = update.effective_user.id
-    user_lang = (db_user.language if db_user and db_user.language else "ar").lower()
+    user_lang = get_user_lang(db_user)
     is_premium = bool(getattr(update.effective_user, "is_premium", False))
 
-    counts = await _get_available_counts_for_user(user_id, user_lang, is_premium)
+    counts, flash_event = await _get_available_counts_for_user(user_id, user_lang, is_premium)
     channel_count = counts["channel"]
     group_count = counts["group"]
     post_count = counts["post"]
@@ -69,33 +73,44 @@ async def show_earnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     reactions_count = counts["reaction_random"] + counts["reaction_fixed"]
     premium_count = counts["premium"]
 
-    text = (
-        f"📣 مهام القنوات: {channel_count}\n"
-        f"👤 مهام المجموعات: {group_count}\n"
-        f"👁️ مهام المشاهدة: {post_count}\n"
-        f"🤖 مهام البوت: {bot_count}\n"
-        f"⚡ مهام الشحن: {premium_count}\n"
-        f"🔥 مهام التفاعل: {reactions_count}\n\n"
-        f"🔔 اختر طريقة الكسب 👇"
+    banner = ""
+    if flash_event:
+        banner = get_text(
+            user_lang,
+            "flash_banner_earnings",
+            title=esc(flash_event.title),
+            mult=format_multiplier(flash_event.multiplier_pct),
+            ends=flash_event.ends_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    text = banner + get_text(
+        user_lang,
+        "earnings_menu",
+        channel_count=channel_count,
+        group_count=group_count,
+        post_count=post_count,
+        bot_count=bot_count,
+        premium_count=premium_count,
+        reactions_count=reactions_count,
     )
 
     keyboard = [
-        [InlineKeyboardButton("📣 اشترك في القناة", callback_data="tasks_channel")],
-        [InlineKeyboardButton("👥 انضم إلى المجموعة", callback_data="tasks_group")],
-        [InlineKeyboardButton("👁️ عرض المنشورات", callback_data="tasks_post")],
-        [InlineKeyboardButton("🤖 الانتقال إلى البوت", callback_data="tasks_bot_menu")],
-        [InlineKeyboardButton("🔥 تفاعلات", callback_data="tasks_reactions_menu")],
-        [InlineKeyboardButton("⚡ شحن بريميوم", callback_data="tasks_premium")],
-        [InlineKeyboardButton("📕 القواعد", callback_data="tasks_rules")],
-        [InlineKeyboardButton("🔙 إلغاء", callback_data="close_menu")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_channel"), callback_data="tasks_channel")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_group"), callback_data="tasks_group")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_post"), callback_data="tasks_post")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_bot"), callback_data="tasks_bot_menu")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_reactions"), callback_data="tasks_reactions_menu")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_premium"), callback_data="tasks_premium")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_rules"), callback_data="tasks_rules")],
+        [InlineKeyboardButton(get_text(user_lang, "btn_cancel"), callback_data="close_menu")],
     ]
 
     markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=markup)
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     else:
-        await update.message.reply_text(text, reply_markup=markup)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def show_bot_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,31 +121,26 @@ async def show_bot_categories_menu(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    user_lang = (db_user.language if db_user and db_user.language else "ar").lower()
+    user_lang = get_user_lang(db_user)
     is_premium = bool(getattr(update.effective_user, "is_premium", False))
 
-    counts = await _get_available_counts_for_user(user_id, user_lang, is_premium)
+    counts, _ = await _get_available_counts_for_user(user_id, user_lang, is_premium)
 
-    text = (
-        f"اختر فئة البوت.\n"
-        f"العادية: {counts['bot_normal']}\n"
-        f"الويب: {counts['bot_webapp']}\n"
-        f"مع الشروط: {counts['bot_conditions']}\n\n"
-        f"📱 <b>بوتات مع Web App</b>\n"
-        f"بوتات تملك تكاملاً مع تطبيقات الويب.\n\n"
-        f"🤖 <b>بوتات عادية</b>\n"
-        f"بوتات تليجرام التقليدية دون واجهات ويب إضافية.\n\n"
-        f"📋 <b>بوتات بشروط إضافية</b>\n"
-        f"يجب تنفيذ إجراءات إضافية: اجتياز كابتشا، اختيار لغة، أو الاشتراك في قنوات."
+    text = get_text(
+        user_lang,
+        "earnings_bot_menu",
+        bot_normal=counts["bot_normal"],
+        bot_webapp=counts["bot_webapp"],
+        bot_conditions=counts["bot_conditions"],
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("🤖 بوتات عادية", callback_data="tasks_bot_normal"),
-            InlineKeyboardButton("📱 بوتات مع Web App", callback_data="tasks_bot_webapp"),
+            InlineKeyboardButton(get_text(user_lang, "earnings_btn_bot_normal"), callback_data="tasks_bot_normal"),
+            InlineKeyboardButton(get_text(user_lang, "earnings_btn_bot_webapp"), callback_data="tasks_bot_webapp"),
         ],
-        [InlineKeyboardButton("📋 مع شروط إضافية", callback_data="tasks_bot_conditions")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="earnings_menu")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_bot_conditions"), callback_data="tasks_bot_conditions")],
+        [InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data="earnings_menu")],
     ]
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -144,44 +154,36 @@ async def show_reactions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    user_lang = (db_user.language if db_user and db_user.language else "ar").lower()
+    user_lang = get_user_lang(db_user)
     is_premium = bool(getattr(update.effective_user, "is_premium", False))
 
-    counts = await _get_available_counts_for_user(user_id, user_lang, is_premium)
+    counts, _ = await _get_available_counts_for_user(user_id, user_lang, is_premium)
 
-    text = (
-        f"اختر فئة التفاعل.\n"
-        f"أي تفاعل: {counts['reaction_random']}\n"
-        f"التفاعل المحدد: {counts['reaction_fixed']}\n\n"
-        f"أي تفاعل – يمكنك اختيار ما تريد للحصول على الدفع.\n\n"
-        f"التفاعل المحدد – يجب استخدام التفاعل المذكور للدفع."
+    text = get_text(
+        user_lang,
+        "earnings_reactions_menu",
+        reaction_random=counts["reaction_random"],
+        reaction_fixed=counts["reaction_fixed"],
     )
 
     keyboard = [
-        [InlineKeyboardButton("تفاعلات عشوائية", callback_data="tasks_reaction_random")],
-        [InlineKeyboardButton("🎯 تفاعلات ثابتة", callback_data="tasks_reaction_fixed")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="earnings_menu")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_reaction_random"), callback_data="tasks_reaction_random")],
+        [InlineKeyboardButton(get_text(user_lang, "earnings_btn_reaction_fixed"), callback_data="tasks_reaction_fixed")],
+        [InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data="earnings_menu")],
     ]
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def show_rules_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     await query.answer()
+    lang = get_user_lang(db_user)
 
-    text = (
-        "📕 <b>قواعد تنفيذ المهام:</b>\n\n"
-        "يُمنع إلغاء الاشتراك من القنوات/المجموعات قبل مرور <b>7 أيام</b>.\n"
-        "مخالفة القاعدة تعني خصم المكافأة تلقائياً، خفض نقاط الثقة، وحظر تنفيذ المهام:\n\n"
-        "• مخالفة أولى – حظر 24 ساعة\n"
-        "• مخالفتان – حظر 7 أيام\n"
-        "• ثلاث مخالفات أو أكثر – <b>حظر دائم</b>"
-    )
-
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="earnings_menu")]]
+    text = get_text(lang, "earnings_rules_text")
+    keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="earnings_menu")]]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))

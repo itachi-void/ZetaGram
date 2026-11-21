@@ -13,7 +13,8 @@ from utils.telegram_api import check_user_subscription_status
 from utils.pagination import build_pagination_keyboard
 from utils.security import user_lock_manager
 from utils.gatekeeper import enforce_user_access
-from utils.rewards import award_task_completion, dispatch_completion_notifications
+from utils.rewards import award_task_completion, dispatch_completion_notifications, format_flash_note
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc, utcnow
 
 PAGE_SIZE = 10
@@ -32,7 +33,7 @@ async def handle_task_list(
         await query.answer()
 
     is_premium = bool(getattr(update.effective_user, "is_premium", False))
-    user_lang = (db_user.language if db_user and db_user.language else "ar").lower()
+    user_lang = get_user_lang(db_user)
 
     async with AsyncSessionLocal() as session:
         completed_ids = [
@@ -88,35 +89,20 @@ async def handle_task_list(
     page_tasks = all_tasks[start_idx : start_idx + PAGE_SIZE]
 
     if task_type in ["channel", "group"]:
-        header = (
-            "📣 <b>اختر مهمة للاشتراك ثم اضغط «🔄 فحص»:</b>\n\n"
-            "⚠️ يُمنع مغادرة القنوات/المجموعات قبل 7 أيام، وإلا سيتم خصم المكافأة وحظر حسابك من المهام."
-        )
+        header = get_text(user_lang, "task_list_channel_header")
     elif task_type == "post":
-        header = (
-            "👁️ <b>مهام مشاهدة المنشورات:</b>\n\n"
-            f"اضغط على المهمة لفتح المنشور وانتظر {MIN_POST_VIEW_SECONDS} ثوانٍ ثم اضغط استلام."
-        )
+        header = get_text(user_lang, "task_list_post_header", seconds=MIN_POST_VIEW_SECONDS)
     elif task_type in ["reaction_random", "reaction_fixed"]:
-        header = (
-            "🔥 <b>مهام التفاعلات:</b>\n\n"
-            "اختر مهمة للتفاعل مع المنشور وإرسال لقطة شاشة كإثبات للمراجعة."
-        )
+        header = get_text(user_lang, "task_list_reactions_header")
     elif task_type == "premium":
-        header = (
-            "⚡ <b>مهام Telegram Premium الحصرية:</b>\n\n"
-            "مكافآت مضاعفة لمشتركي بريميوم! اختر مهمة للبدء:"
-        )
+        header = get_text(user_lang, "task_list_premium_header")
     else:
-        header = (
-            "🤖 <b>مهام البوتات:</b>\n\n"
-            "اختر مهمة للدخول إلى البوت والتحقق التلقائي أو إرسال لقطة شاشة."
-        )
+        header = get_text(user_lang, "task_list_bot_header")
 
     items_buttons = []
     if not page_tasks:
         items_buttons.append(
-            [InlineKeyboardButton("❌ لا توجد مهام متاحة لك حالياً", callback_data="ignore")]
+            [InlineKeyboardButton(get_text(user_lang, "task_list_empty"), callback_data="ignore")]
         )
     else:
         for t in page_tasks:
@@ -126,9 +112,9 @@ async def handle_task_list(
                 row = [
                     InlineKeyboardButton("🚨", callback_data=report_cb),
                     InlineKeyboardButton("⏭️", callback_data=skip_cb),
-                    InlineKeyboardButton("🔄 فحص", callback_data=f"check_task_{t.id}"),
+                    InlineKeyboardButton(get_text(user_lang, "task_btn_check"), callback_data=f"check_task_{t.id}"),
                     InlineKeyboardButton(
-                        f"اشتراك | +{t.reward_grams:,} 💰", url=t.target_url
+                        get_text(user_lang, "task_btn_subscribe_item", reward=t.reward_grams), url=t.target_url
                     ),
                 ]
             elif task_type == "post":
@@ -136,7 +122,7 @@ async def handle_task_list(
                     InlineKeyboardButton("🚨", callback_data=report_cb),
                     InlineKeyboardButton("⏭️", callback_data=skip_cb),
                     InlineKeyboardButton(
-                        f"👁️ مشاهدة منشور +{t.reward_grams:,} غرام",
+                        get_text(user_lang, "task_btn_post_item", reward=t.reward_grams),
                         callback_data=f"start_post_{t.id}",
                     ),
                 ]
@@ -145,16 +131,22 @@ async def handle_task_list(
                     InlineKeyboardButton("🚨", callback_data=report_cb),
                     InlineKeyboardButton("⏭️", callback_data=skip_cb),
                     InlineKeyboardButton(
-                        f"🤖 تنفيذ البوت | +{t.reward_grams:,} غرام",
+                        get_text(user_lang, "task_btn_bot_item", reward=t.reward_grams),
                         callback_data=f"open_bot_task_{t.id}",
                     ),
                 ]
             else:
+                prefix = "⚡ " if getattr(t, "auto_verify_reactions", False) else "🔥 "
                 row = [
                     InlineKeyboardButton("🚨", callback_data=report_cb),
                     InlineKeyboardButton("⏭️", callback_data=skip_cb),
                     InlineKeyboardButton(
-                        f"🔥 تنفيذ وإثبات | +{t.reward_grams:,} غرام",
+                        get_text(
+                            user_lang,
+                            "task_btn_reaction_item",
+                            prefix=prefix,
+                            reward=t.reward_grams,
+                        ),
                         callback_data=f"open_proof_task_{t.id}",
                     ),
                 ]
@@ -166,6 +158,7 @@ async def handle_task_list(
         total_pages=total_pages,
         category_code=task_type,
         back_callback="earnings_menu",
+        lang=user_lang,
     )
 
     if query:
@@ -175,16 +168,16 @@ async def handle_task_list(
 
 
 async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    user_lang = get_user_lang(db_user)
     task_id = int(query.data.split("_")[-1])
 
     async with user_lock_manager.acquire_ordered_locks(("user", user_id), ("task", task_id)):
-        # Step 1: Validate task & subscription outside write transaction
         async with AsyncSessionLocal() as session:
             user = (
                 await session.execute(select(User).where(User.telegram_id == user_id))
@@ -192,11 +185,13 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             task = (
                 await session.execute(select(Task).where(Task.id == task_id))
             ).scalar_one_or_none()
+            if user:
+                user_lang = get_user_lang(user)
             if not task or task.status != "active" or task.completed_qty >= task.total_qty:
-                await query.answer("❌ هذه المهمة غير متاحة الآن أو اكتملت.", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
                 return
             if task.created_by == user_id:
-                await query.answer("❌ لا يمكنك تنفيذ مهمتك الخاصة!", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_own"), show_alert=True)
                 return
 
             already_done = (
@@ -207,7 +202,7 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             ).scalar_one_or_none()
             if already_done:
-                await query.answer("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_already"), show_alert=True)
                 return
             chat_id = task.chat_id
             task_type = task.task_type
@@ -216,18 +211,17 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             sub_status = await check_user_subscription_status(context.bot, chat_id, user_id)
             if sub_status == "not_member":
                 await query.answer(
-                    "❌ لم يتم التحقق من الانضمام بعد! اشترك أولاً ثم اضغط فحص.",
+                    get_text(user_lang, "task_err_not_member"),
                     show_alert=True,
                 )
                 return
             if sub_status == "error":
                 await query.answer(
-                    "⚠️ تعذر التحقق من القناة حالياً، يرجى المحاولة بعد لحظات.",
+                    get_text(user_lang, "task_err_check_api"),
                     show_alert=True,
                 )
                 return
 
-        # Step 2: Atomic claim + award inside transaction
         async with AsyncSessionLocal() as session:
             user = (
                 await session.execute(select(User).where(User.telegram_id == user_id))
@@ -236,7 +230,7 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await session.execute(select(Task).where(Task.id == task_id))
             ).scalar_one_or_none()
             if not user or not task or task.status != "active":
-                await query.answer("❌ هذه المهمة غير متاحة الآن.", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
                 return
 
             upd = await session.execute(
@@ -252,7 +246,7 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             if upd.rowcount != 1:
                 await session.rollback()
-                await query.answer("❌ اكتمل العدد المطلوب لهذه المهمة للتو.", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_completed_now"), show_alert=True)
                 return
 
             await session.refresh(task)
@@ -266,12 +260,18 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                await query.answer("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_already"), show_alert=True)
                 return
 
     await dispatch_completion_notifications(context.bot, user_id, reward_info)
+    flash_note = format_flash_note(user_lang, reward_info)
     await query.answer(
-        f"🎉 تم التحقق بنجاح! تمت إضافة +{reward_info['total_reward']:,} غرام إلى رصيدك.",
+        get_text(
+            user_lang,
+            "task_completed_alert",
+            reward=reward_info["total_reward"],
+            flash_note=flash_note,
+        ),
         show_alert=True,
     )
     if reward_info.get("recaptcha_triggered"):
@@ -281,10 +281,11 @@ async def check_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def start_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("start_post_", ""))
@@ -293,41 +294,49 @@ async def start_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
 
     if not task or task.status != "active":
-        await query.answer("❌ المهمة غير متاحة.", show_alert=True)
+        await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
         return
 
     context.user_data[f"post_timer_{task_id}"] = time.time()
-    text = (
-        f"👁️ <b>مهمة مشاهدة منشور:</b> {esc(task.title)}\n\n"
-        f"1️⃣ اضغط على «فتح المنشور» وتصفّحه لمدة <b>{MIN_POST_VIEW_SECONDS} ثوانٍ</b> على الأقل.\n"
-        f"2️⃣ عُد واضغط «✅ استلام المكافأة (+{task.reward_grams:,} غرام)»."
+    text = get_text(
+        user_lang,
+        "post_task_detail",
+        title=esc(task.title),
+        seconds=MIN_POST_VIEW_SECONDS,
+        reward=task.reward_grams,
     )
     keyboard = [
-        [InlineKeyboardButton("🔗 فتح المنشور الآن", url=task.target_url)],
-        [InlineKeyboardButton(f"✅ استلام المكافأة (+{task.reward_grams:,})", callback_data=f"claim_post_{task.id}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="tasks_post")],
+        [InlineKeyboardButton(get_text(user_lang, "post_btn_open"), url=task.target_url)],
+        [
+            InlineKeyboardButton(
+                get_text(user_lang, "post_btn_claim", reward=task.reward_grams),
+                callback_data=f"claim_post_{task.id}",
+            )
+        ],
+        [InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data="tasks_post")],
     ]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    user_lang = get_user_lang(db_user)
     task_id = int(query.data.replace("claim_post_", ""))
 
     started = context.user_data.get(f"post_timer_{task_id}")
     if not started:
-        await query.answer("❌ يرجى فتح المنشور أولاً!", show_alert=True)
+        await query.answer(get_text(user_lang, "post_err_open_first"), show_alert=True)
         return
 
     elapsed = time.time() - float(started)
     if elapsed < MIN_POST_VIEW_SECONDS:
         rem = int(math.ceil(MIN_POST_VIEW_SECONDS - elapsed))
-        await query.answer(f"⏳ يرجى قراءة المنشور والانتظار {rem} ثانية إضافية.", show_alert=True)
+        await query.answer(get_text(user_lang, "post_err_wait", rem=rem), show_alert=True)
         return
 
     async with user_lock_manager.acquire_ordered_locks(("user", user_id), ("task", task_id)):
@@ -338,8 +347,10 @@ async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             task = (
                 await session.execute(select(Task).where(Task.id == task_id))
             ).scalar_one_or_none()
+            if user:
+                user_lang = get_user_lang(user)
             if not user or not task or task.status != "active" or task.created_by == user_id:
-                await query.answer("❌ هذه المهمة غير متاحة الآن.", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
                 return
 
             already = (
@@ -350,7 +361,7 @@ async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             ).scalar_one_or_none()
             if already:
-                await query.answer("⚠️ لقد استلمت مكافأة هذا المنشور مسبقاً!", show_alert=True)
+                await query.answer(get_text(user_lang, "post_err_already"), show_alert=True)
                 return
 
             upd = await session.execute(
@@ -366,7 +377,7 @@ async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             if upd.rowcount != 1:
                 await session.rollback()
-                await query.answer("❌ اكتملت هذه المهمة للتو.", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_completed_now"), show_alert=True)
                 return
 
             await session.refresh(task)
@@ -379,13 +390,20 @@ async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                await query.answer("⚠️ لقد أكملت هذه المهمة بالفعل!", show_alert=True)
+                await query.answer(get_text(user_lang, "task_err_already"), show_alert=True)
                 return
 
     context.user_data.pop(f"post_timer_{task_id}", None)
     await dispatch_completion_notifications(context.bot, user_id, reward_info)
+    flash_note = format_flash_note(user_lang, reward_info)
     await query.answer(
-        f"🎉 تمت إضافة +{reward_info['total_reward']:,} غرام لرصيدك!", show_alert=True
+        get_text(
+            user_lang,
+            "post_claimed_alert",
+            reward=reward_info["total_reward"],
+            flash_note=flash_note,
+        ),
+        show_alert=True,
     )
     if reward_info.get("recaptcha_triggered"):
         await enforce_user_access(update, context, apply_rate_limit=False)
@@ -394,10 +412,11 @@ async def claim_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def open_bot_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("open_bot_task_", ""))
@@ -406,40 +425,46 @@ async def open_bot_task_callback(update: Update, context: ContextTypes.DEFAULT_T
         task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
 
     if not task or task.status != "active":
-        await query.answer("❌ المهمة غير متاحة.", show_alert=True)
+        await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
         return
 
-    text = (
-        f"🤖 <b>مهمة بوت:</b> {esc(task.title)}\n"
-        f"💰 <b>المكافأة:</b> <code>{task.reward_grams:,}</code> غرام\n"
+    desc_line = (
+        get_text(user_lang, "task_desc_line", desc=esc(task.description))
+        if task.description
+        else ""
     )
-    if task.description:
-        text += f"📝 <b>التعليمات:</b> {esc(task.description)}\n"
-    text += "\nاختر طريقة التحقق بعد تشغيل البوت:"
+    text = get_text(
+        user_lang,
+        "bot_task_detail",
+        title=esc(task.title),
+        reward=task.reward_grams,
+        desc_line=desc_line,
+    )
 
-    keyboard = [[InlineKeyboardButton("🚀 الانتقال للبوت", url=task.target_url)]]
+    keyboard = [[InlineKeyboardButton(get_text(user_lang, "bot_btn_open"), url=task.target_url)]]
     if task.bot_username:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "📨 تحقق تلقائي فوري (Forward)",
+                    get_text(user_lang, "bot_btn_fwd"),
                     callback_data=f"prompt_bot_fwd_{task.id}",
                 )
             ]
         )
     keyboard.append(
-        [InlineKeyboardButton("📸 إرسال إثبات بالصورة", callback_data=f"submit_proof_{task.id}")]
+        [InlineKeyboardButton(get_text(user_lang, "bot_btn_proof"), callback_data=f"submit_proof_{task.id}")]
     )
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"tasks_{task.task_type}")])
+    keyboard.append([InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data=f"tasks_{task.task_type}")])
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def prompt_bot_forward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("prompt_bot_fwd_", ""))
@@ -448,17 +473,15 @@ async def prompt_bot_forward_callback(update: Update, context: ContextTypes.DEFA
         task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
 
     if not task or not task.bot_username:
-        await query.answer("❌ التحقق التلقائي غير مفعل لهذه المهمة.", show_alert=True)
+        await query.answer(get_text(user_lang, "bot_fwd_err_disabled"), show_alert=True)
         return
 
     context.user_data["awaiting_bot_forward_task_id"] = task_id
     await query.edit_message_text(
-        f"📨 <b>التحقق التلقائي عبر إعادة التوجيه:</b>\n\n"
-        f"1️⃣ افتح البوت <code>{esc(task.bot_username)}</code> واضغط <code>/start</code>.\n"
-        f"2️⃣ قم بعمل <b>إعادة توجيه (Forward)</b> لرسالة الترحيب من البوت إلى هنا خلال 5 دقائق.",
+        get_text(user_lang, "bot_fwd_prompt", bot_username=esc(task.bot_username)),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 رجوع", callback_data=f"open_bot_task_{task.id}")]]
+            [[InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data=f"open_bot_task_{task.id}")]]
         ),
     )
 
@@ -469,18 +492,16 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
     if not task_id:
         return False
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
     user_id = update.effective_user.id
+    user_lang = get_user_lang(db_user)
     origin = getattr(update.message, "forward_origin", None)
 
     if not isinstance(origin, MessageOriginUser) or not origin.sender_user.is_bot:
-        await update.message.reply_text(
-            "❌ الرسالة المعاد توجيهها ليست من بوت (أو أن خصوصية التوجيه مخفية). "
-            "يرجى إعادة توجيه رسالة مباشرة من البوت المطلوب أو استخدام إثبات الصورة."
-        )
+        await update.message.reply_text(get_text(user_lang, "bot_fwd_err_not_bot"))
         return True
 
     fwd_username = (origin.sender_user.username or "").lstrip("@").lower()
@@ -490,9 +511,7 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
         else origin.date
     )
     if (utcnow() - fwd_dt).total_seconds() > 300:
-        await update.message.reply_text(
-            "⌛ رسالة البوت المعاد توجيهها قديمة (أكثر من 5 دقائق). أرسل /start للبوت الآن وأعد توجيه الرسالة الجديدة."
-        )
+        await update.message.reply_text(get_text(user_lang, "bot_fwd_err_stale"))
         return True
 
     async with user_lock_manager.acquire_ordered_locks(("user", user_id), ("task", task_id)):
@@ -503,15 +522,22 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
             task = (
                 await session.execute(select(Task).where(Task.id == task_id))
             ).scalar_one_or_none()
+            if user:
+                user_lang = get_user_lang(user)
             if not user or not task or task.status != "active":
                 context.user_data.pop("awaiting_bot_forward_task_id", None)
-                await update.message.reply_text("❌ المهمة غير متاحة حالياً.")
+                await update.message.reply_text(get_text(user_lang, "task_err_unavailable"))
                 return True
 
             expected = (task.bot_username or "").lstrip("@").lower()
             if not expected or fwd_username != expected:
                 await update.message.reply_text(
-                    f"❌ هذه الرسالة من بوت مختلف (<code>@{esc(fwd_username)}</code>) وليس البوت المطلوب (<code>@{esc(expected)}</code>).",
+                    get_text(
+                        user_lang,
+                        "bot_fwd_err_wrong_bot",
+                        actual=esc(fwd_username),
+                        expected=esc(expected),
+                    ),
                     parse_mode="HTML",
                 )
                 return True
@@ -525,7 +551,7 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
             ).scalar_one_or_none()
             if already:
                 context.user_data.pop("awaiting_bot_forward_task_id", None)
-                await update.message.reply_text("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!")
+                await update.message.reply_text(get_text(user_lang, "task_err_already"))
                 return True
 
             upd = await session.execute(
@@ -542,7 +568,7 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
             if upd.rowcount != 1:
                 await session.rollback()
                 context.user_data.pop("awaiting_bot_forward_task_id", None)
-                await update.message.reply_text("❌ اكتمل العدد المطلوب لهذه المهمة للتو.")
+                await update.message.reply_text(get_text(user_lang, "task_err_completed_now"))
                 return True
 
             await session.refresh(task)
@@ -556,24 +582,30 @@ async def handle_bot_forward_message(update: Update, context: ContextTypes.DEFAU
             except IntegrityError:
                 await session.rollback()
                 context.user_data.pop("awaiting_bot_forward_task_id", None)
-                await update.message.reply_text("⚠️ لقد قمت بإكمال هذه المهمة بالفعل!")
+                await update.message.reply_text(get_text(user_lang, "task_err_already"))
                 return True
 
     context.user_data.pop("awaiting_bot_forward_task_id", None)
     await dispatch_completion_notifications(context.bot, user_id, reward_info)
+    flash_note = format_flash_note(user_lang, reward_info)
     await update.message.reply_text(
-        f"🎉 <b>تم التحقق الفوري من البوت بنجاح!</b>\n"
-        f"💰 تم إضافة <b>+{reward_info['total_reward']:,} غرام</b> إلى رصيدك!",
+        get_text(
+            user_lang,
+            "bot_fwd_success",
+            reward=reward_info["total_reward"],
+            flash_note=flash_note,
+        ),
         parse_mode="HTML",
     )
     return True
 
 
 async def open_proof_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("open_proof_task_", ""))
@@ -582,53 +614,69 @@ async def open_proof_task_callback(update: Update, context: ContextTypes.DEFAULT
         task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
 
     if not task or task.status != "active":
-        await query.answer("❌ المهمة غير متاحة.", show_alert=True)
+        await query.answer(get_text(user_lang, "task_err_unavailable"), show_alert=True)
         return
 
-    text = (
-        f"🔥 <b>تفاصيل المهمة:</b> {esc(task.title)}\n"
-        f"💰 <b>المكافأة:</b> <code>{task.reward_grams:,}</code> غرام\n"
+    emoji_line = (
+        get_text(user_lang, "proof_emoji_line", emoji=esc(task.required_emoji))
+        if task.required_emoji
+        else ""
     )
-    if task.required_emoji:
-        text += f"🎭 <b>التفاعل المطلوب:</b> {esc(task.required_emoji)}\n"
-    if task.description:
-        text += f"📝 <b>التعليمات:</b> {esc(task.description)}\n"
-    text += "\n1️⃣ افتح الرابط ونفذ المطلوب.\n2️⃣ اضغط «📸 إرسال صورة الإثبات» وأرسل لقطة الشاشة."
+    desc_line = (
+        get_text(user_lang, "task_desc_line", desc=esc(task.description))
+        if task.description
+        else ""
+    )
+    is_auto_rx = bool(
+        getattr(task, "auto_verify_reactions", False)
+        and task.task_type in ("reaction_random", "reaction_fixed")
+    )
+    steps_text = get_text(
+        user_lang,
+        "proof_task_auto_note" if is_auto_rx else "proof_task_manual_steps",
+    )
+
+    text = get_text(
+        user_lang,
+        "proof_task_detail",
+        title=esc(task.title),
+        reward=task.reward_grams,
+        emoji_line=emoji_line,
+        desc_line=desc_line,
+        steps_text=steps_text,
+    )
 
     keyboard = [
-        [InlineKeyboardButton("🔗 فتح الرابط", url=task.target_url)],
-        [InlineKeyboardButton("📸 إرسال صورة الإثبات", callback_data=f"submit_proof_{task.id}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data=f"tasks_{task.task_type}")],
+        [InlineKeyboardButton(get_text(user_lang, "proof_btn_open"), url=task.target_url)],
+        [InlineKeyboardButton(get_text(user_lang, "proof_btn_submit"), callback_data=f"submit_proof_{task.id}")],
+        [InlineKeyboardButton(get_text(user_lang, "btn_back"), callback_data=f"tasks_{task.task_type}")],
     ]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def submit_proof_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("submit_proof_", ""))
     context.user_data["pending_task_id"] = task_id
 
-    await query.edit_message_text(
-        "📸 <b>إرسال إثبات التنفيذ:</b>\n\n"
-        "قم بإرسال <b>صورة لقطة الشاشة (Screenshot)</b> هنا الآن ليتم مراجعتها وصرف المكافأة.",
-        parse_mode="HTML",
-    )
+    await query.edit_message_text(get_text(user_lang, "proof_submit_prompt"), parse_mode="HTML")
 
 
 async def skip_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     parts = query.data.split("_")
-    # Format: skip_task_<tid>_<category...>_<page>
     task_id = int(parts[2])
     page = int(parts[-1])
     category = "_".join(parts[3:-1])
@@ -640,37 +688,37 @@ async def skip_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except IntegrityError:
             await session.rollback()
 
-    await query.answer("⏭️ تم تخطي المهمة وإخفاؤها.")
+    await query.answer(get_text(user_lang, "task_skipped_alert"))
     await handle_task_list(update, context, category, page)
 
 
 async def report_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     task_id = int(query.data.replace("report_task_", ""))
     context.user_data["awaiting_report_task_id"] = task_id
     await query.edit_message_text(
-        f"🚨 <b>تبليغ عن المهمة #{task_id}:</b>\n\n"
-        f"اكتب سبب التبليغ في رسالة الآن (مثال: الرابط معطل / قناة مخالفة).",
+        get_text(user_lang, "report_task_prompt", task_id=task_id),
         parse_mode="HTML",
     )
 
 
 async def report_issue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    user_lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     context.user_data["awaiting_report_task_id"] = 0
     await query.edit_message_text(
-        "🚨 <b>تبليغ عن مشكلة:</b>\n\n"
-        "اكتب تفاصيل المشكلة أو رقم المهمة في رسالة الآن ليتم مراجعتها من الإدارة.",
+        get_text(user_lang, "report_issue_prompt"),
         parse_mode="HTML",
     )
 
@@ -680,11 +728,12 @@ async def process_report_reason_input(update: Update, context: ContextTypes.DEFA
     if task_id is None:
         return False
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
     user_id = update.effective_user.id
+    user_lang = get_user_lang(db_user)
     reason = update.message.text.strip()[:500]
     context.user_data.pop("awaiting_report_task_id", None)
 
@@ -700,7 +749,7 @@ async def process_report_reason_input(update: Update, context: ContextTypes.DEFA
                 await session.commit()
                 report_id = rep.id
 
-    await update.message.reply_text("✅ <b>تم استلام بلاغك وسيتم مراجعته من الإدارة!</b>", parse_mode="HTML")
+    await update.message.reply_text(get_text(user_lang, "report_received"), parse_mode="HTML")
 
     admin_msg = (
         f"🚨 <b>بلاغ جديد من مستخدم:</b>\n\n"

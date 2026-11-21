@@ -1,8 +1,48 @@
+import re
 import asyncio
 import logging
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional
 from telegram import Bot
 from telegram.error import RetryAfter, TelegramError
+
+
+def normalize_emoji(emoji: Optional[str]) -> str:
+    """Normalize an emoji string by stripping whitespace and variation selector FE0F."""
+    if not emoji:
+        return ""
+    return emoji.strip().replace("\ufe0f", "")
+
+
+def parse_telegram_post_link(url: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Parse public (https://t.me/<username>/<msg_id>) or private supergroup/channel
+    (https://t.me/c/<internal_id>/<msg_id>) post URLs.
+    Returns (chat_ref, message_id) or (None, None) if not a recognizable post link.
+    """
+    if not url or not isinstance(url, str):
+        return None, None
+    clean = url.strip().split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    m_priv = re.match(
+        r"^https?://(?:t\.me|telegram\.me)/c/(\d+)/(\d+)(?:/\d+)?$",
+        clean,
+        re.IGNORECASE,
+    )
+    if m_priv:
+        internal_id, msg_id_str = m_priv.group(1), m_priv.group(2)
+        return f"-100{internal_id}", int(msg_id_str)
+
+    m_pub = re.match(
+        r"^https?://(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)(?:/\d+)?$",
+        clean,
+        re.IGNORECASE,
+    )
+    if m_pub:
+        username, msg_id_str = m_pub.group(1), m_pub.group(2)
+        if username.lower() in ("c", "joinchat", "addstickers", "share", "s"):
+            return None, None
+        return f"@{username}", int(msg_id_str)
+
+    return None, None
 
 
 async def check_user_subscription_status(

@@ -32,4 +32,7 @@ USER appuser
 
 VOLUME ["/app/data"]
 
+HEALTHCHECK --interval=60s --timeout=5s --start-period=15s --retries=3 \
+  CMD python -c "import os; assert os.access('/app/data', os.W_OK)" || exit 1
+
 CMD ["python", "main.py"]

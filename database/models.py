@@ -57,6 +57,7 @@ class Task(Base):
     __table_args__ = (
         Index("ix_tasks_type_status", "task_type", "status"),
         Index("ix_tasks_created_by", "created_by"),
+        Index("ix_tasks_chat_msg", "chat_id", "target_message_id"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -80,6 +81,10 @@ class Task(Base):
     commission_paid = Column(Integer, default=0)
     bot_username = Column(String(64), nullable=True)
     required_emoji = Column(String(32), nullable=True)
+    target_message_id = Column(BigInteger, nullable=True)
+    auto_verify_reactions = Column(Boolean, default=False)
+    promo_code_used = Column(String(64), nullable=True)
+    promo_subsidy = Column(Integer, default=0)
 
     submissions = relationship("UserTask", back_populates="task")
 
@@ -248,4 +253,50 @@ class WeeklyLeaderboardRun(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     week_key = Column(String(16), unique=True, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)
+    discount_percent = Column(Integer, nullable=False)
+    discount_scope = Column(String(16), default="commission")  # commission | total
+    max_uses = Column(Integer, default=100)
+    used_count = Column(Integer, default=0)
+    min_order_grams = Column(Integer, default=0)
+    expires_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class PromoCodeRedemption(Base):
+    __tablename__ = "promo_code_redemptions"
+    __table_args__ = (
+        UniqueConstraint("promo_code_id", "user_id", name="uq_promo_redemption"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    promo_code_id = Column(Integer, ForeignKey("promo_codes.id"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+    discount_grams = Column(Integer, default=0)
+    redeemed_at = Column(DateTime, default=utcnow)
+
+
+class FlashEvent(Base):
+    __tablename__ = "flash_events"
+    __table_args__ = (
+        Index("ix_flash_events_active_window", "is_active", "starts_at", "ends_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(128), nullable=False)
+    multiplier_pct = Column(Integer, default=200)  # e.g. 150 = 1.5x, 200 = 2x, 300 = 3x
+    starts_at = Column(DateTime, nullable=False)
+    ends_at = Column(DateTime, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=utcnow)

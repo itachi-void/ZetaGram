@@ -11,14 +11,16 @@ from telegram import (
     LabeledPrice,
 )
 from telegram.ext import ContextTypes
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update, and_
 
 from config import STARS_FEE_FREE_COST
 from database.db import AsyncSessionLocal
-from database.models import User, Task, Transaction
+from database.models import User, Task, Transaction, PromoCode, PromoCodeRedemption
 from utils.security import user_lock_manager, sanitize_amount, get_vip_perks
 from utils.gatekeeper import enforce_user_access
-from utils.telegram_api import check_bot_is_admin
+from utils.telegram_api import check_bot_is_admin, parse_telegram_post_link
+from utils.promotions import validate_promo_code, calculate_campaign_pricing
+from utils.i18n import get_text, get_user_lang, get_vip_title
 from utils.html_utils import esc, utcnow
 
 _PROMO_LANGS = [
@@ -53,32 +55,29 @@ async def show_promotion_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not ok:
         return
 
+    lang = get_user_lang(user)
     balance = user.balance if user else 0
     fee_pct = round(_get_effective_promo_fee(user) * 100, 1)
 
-    text = (
-        f"📣 <b>ماذا تريد أن تروّج؟</b>\n\n"
-        f"💳 <b>رصيدك:</b> <code>{balance:,}</code> غرام\n"
-        f"📉 <b>عمولتك الحالية:</b> <code>{fee_pct}%</code>"
-    )
+    text = get_text(lang, "promo_menu", balance=balance, fee_pct=fee_pct)
 
     keyboard = [
         [
-            InlineKeyboardButton("👥 مجموعة", callback_data="promo_cat_group"),
-            InlineKeyboardButton("📣 قناة", callback_data="promo_cat_channel"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_group"), callback_data="promo_cat_group"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_channel"), callback_data="promo_cat_channel"),
         ],
         [
-            InlineKeyboardButton("🤖 بوت", callback_data="promo_cat_bot"),
-            InlineKeyboardButton("👁️ منشور", callback_data="promo_cat_post"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_bot"), callback_data="promo_cat_bot"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_post"), callback_data="promo_cat_post"),
         ],
         [
-            InlineKeyboardButton("🔥 التفاعلات", callback_data="promo_cat_reactions"),
-            InlineKeyboardButton("⚡ شحن بريميوم", callback_data="promo_cat_premium"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_reactions"), callback_data="promo_cat_reactions"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_premium"), callback_data="promo_cat_premium"),
         ],
-        [InlineKeyboardButton("⚙️ إعدادات الترويج والعمولة", callback_data="promo_auto_settings")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_settings"), callback_data="promo_auto_settings")],
         [
-            InlineKeyboardButton("🔙 رجوع", callback_data="close_menu"),
-            InlineKeyboardButton("💼 مهامي وإدارتها", callback_data="promo_my_tasks"),
+            InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu"),
+            InlineKeyboardButton(get_text(lang, "promo_btn_my_tasks"), callback_data="promo_my_tasks"),
         ],
     ]
 
@@ -91,120 +90,126 @@ async def show_promotion_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def promo_category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     category = query.data.replace("promo_cat_", "")
 
     if category == "bot":
         kb = [
-            [InlineKeyboardButton("🤖 بوت عادي", callback_data="promo_sub_bot_normal")],
-            [InlineKeyboardButton("📱 بوت Web App", callback_data="promo_sub_bot_webapp")],
-            [InlineKeyboardButton("📋 بوت بشروط إضافية", callback_data="promo_sub_bot_conditions")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")],
+            [InlineKeyboardButton(get_text(lang, "promo_btn_bot_normal"), callback_data="promo_sub_bot_normal")],
+            [InlineKeyboardButton(get_text(lang, "promo_btn_bot_webapp"), callback_data="promo_sub_bot_webapp")],
+            [InlineKeyboardButton(get_text(lang, "promo_btn_bot_conditions"), callback_data="promo_sub_bot_conditions")],
+            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")],
         ]
         await query.edit_message_text(
-            "🤖 <b>اختر نوع حملة البوت:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
+            get_text(lang, "promo_bot_type_prompt"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
     if category == "reactions":
         kb = [
-            [InlineKeyboardButton("🎲 تفاعل عشوائي", callback_data="promo_sub_reaction_random")],
-            [InlineKeyboardButton("🎯 تفاعل محدد بإيموجي", callback_data="promo_sub_reaction_fixed")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")],
+            [InlineKeyboardButton(get_text(lang, "promo_btn_reaction_random"), callback_data="promo_sub_reaction_random")],
+            [InlineKeyboardButton(get_text(lang, "promo_btn_reaction_fixed"), callback_data="promo_sub_reaction_fixed")],
+            [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")],
         ]
         await query.edit_message_text(
-            "🔥 <b>اختر نوع التفاعل المطلوب:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
+            get_text(lang, "promo_reaction_type_prompt"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
     context.user_data["promo_category"] = category
-    await _show_account_type_step(query)
+    await _show_account_type_step(query, lang)
 
 
 async def promo_subtype_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     subtype = query.data.replace("promo_sub_", "")
     context.user_data["promo_category"] = subtype
-    await _show_account_type_step(query)
+    await _show_account_type_step(query, lang)
 
 
-async def _show_account_type_step(query):
-    text = (
-        "اختر نوع الحساب:\n\n"
-        "1️⃣ <b>جميع المستخدمين</b> – متاح لكل مستخدمي ZetaGram للانتشار السريع.\n"
-        "🔴 الحد الأدنى للسعر للوحدة – 750 غرام\n\n"
-        "2️⃣ <b>Telegram Premium</b> – متاح فقط لمستخدمي Telegram Premium 🌟 الجمهور أعلى جودة.\n"
-        "🔴 الحد الأدنى للسعر للوحدة – 1,400 غرام"
-    )
+async def _show_account_type_step(query, lang: str = "ar"):
+    text = get_text(lang, "promo_account_type_prompt")
     keyboard = [
-        [InlineKeyboardButton("1️⃣ متاح لجميع المستخدمين", callback_data="account_type_all")],
-        [InlineKeyboardButton("2️⃣ فقط مستخدمو Telegram Premium 🌟", callback_data="account_type_premium")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_acc_all"), callback_data="account_type_all")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_acc_premium"), callback_data="account_type_premium")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")],
     ]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def promo_account_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     acc_type = query.data.replace("account_type_", "")
     context.user_data["promo_acc_type"] = acc_type
     context.user_data["min_price"] = 1400 if acc_type == "premium" else 750
     context.user_data["promo_langs"] = []
+    context.user_data.pop("promo_applied_code", None)
 
-    text = (
-        "🎯 <b>الجمهور:</b> 🌐 بدون قيود\n\n"
-        "🌍 <b>اختر الجمهور المستهدف للمهمة:</b>\n\n"
-        "💡 <i>يُضاف +100 غرام للحد الأدنى عند تخصيص لغات محددة.</i>"
-    )
+    text = get_text(lang, "promo_audience_prompt")
     keyboard = [
-        [InlineKeyboardButton("🌍 السماح للجميع", callback_data="audience_all")],
-        [InlineKeyboardButton("🎯 اختيار لغات محددة", callback_data="audience_custom")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_audience_all"), callback_data="audience_all")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_audience_custom"), callback_data="audience_custom")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")],
     ]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def promo_audience_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     aud_choice = query.data
 
     if aud_choice == "audience_custom":
-        return await show_language_grid(update, context)
+        return await show_language_grid(update, context, lang=lang)
 
     context.user_data["promo_langs"] = []
-    return await prompt_price_input(update, context)
+    return await prompt_price_input(update, context, lang=lang)
 
 
-async def show_language_grid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_language_grid(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str | None = None
+):
+    if lang is None:
+        async with AsyncSessionLocal() as s:
+            u = (
+                await s.execute(select(User).where(User.telegram_id == update.effective_user.id))
+            ).scalar_one_or_none()
+            lang = get_user_lang(u)
+
     query = update.callback_query
     selected = set(context.user_data.get("promo_langs", []))
-    selected_str = ", ".join(sorted(selected)) if selected else "🌐 بدون قيود"
-
-    text = (
-        f"🎯 <b>اللغات المختارة:</b> {esc(selected_str)}\n\n"
-        "🌍 <b>اضغط على اللغات لاختيارها أو إلغائها:</b>\n"
-        "💡 <i>تحديد لغة يضيف +100 غرام للحد الأدنى للسعر.</i>"
+    selected_str = (
+        ", ".join(sorted(selected)) if selected else get_text(lang, "promo_lang_unlimited")
     )
+
+    text = get_text(lang, "promo_lang_grid_prompt", selected=esc(selected_str))
 
     keyboard = []
     row = []
@@ -217,17 +222,20 @@ async def show_language_grid(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if row:
         keyboard.append(row)
 
-    keyboard.append([InlineKeyboardButton(f"✅ تأكيد ({len(selected)} لغة)", callback_data="audience_done")])
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="audience_all")])
+    keyboard.append(
+        [InlineKeyboardButton(get_text(lang, "promo_btn_lang_done", count=len(selected)), callback_data="audience_done")]
+    )
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="audience_all")])
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def toggle_promo_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     lang_code = query.data.replace("lang_", "")
@@ -237,34 +245,37 @@ async def toggle_promo_language(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         selected.append(lang_code)
     context.user_data["promo_langs"] = selected
-    await show_language_grid(update, context)
+    await show_language_grid(update, context, lang=lang)
 
 
 async def audience_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     selected = context.user_data.get("promo_langs", [])
     base_min = 1400 if context.user_data.get("promo_acc_type") == "premium" else 750
     context.user_data["min_price"] = base_min + (100 if selected else 0)
-    await prompt_price_input(update, context)
+    await prompt_price_input(update, context, lang=lang)
 
 
-async def prompt_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def prompt_price_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str = "ar"
+):
     query = update.callback_query
     min_price = context.user_data.get("min_price", 750)
     context.user_data["awaiting_promo_price"] = True
 
-    text = (
-        f"حدد سعر اشتراك/تنفيذ واحد. لإنشاء مهمة، يجب أن يكون لديك رصيد كافٍ.\n\n"
-        f"🔴 <b>السعر الأدنى للوحدة – {min_price:,} غرام</b>\n\n"
-        f"💡 <i>ملاحظة: لظهور أسرع في أعلى القائمة اجعل السعر أعلى من {min_price + 500:,} غرام.</i>\n\n"
-        f"📝 <b>اكتب السعر المطلوب للمشترك الواحد الآن (رقم صحيح):</b>"
+    text = get_text(
+        lang,
+        "promo_price_prompt",
+        min_price=min_price,
+        fast_price=min_price + 500,
     )
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")]]
+    keyboard = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")]]
     if query:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -275,12 +286,15 @@ async def process_promo_price_input(update: Update, context: ContextTypes.DEFAUL
     if not context.user_data.get("awaiting_promo_price"):
         return False
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
+    lang = get_user_lang(db_user)
     min_price = context.user_data.get("min_price", 750)
-    ok_amt, price, err = sanitize_amount(update.message.text.strip(), min_val=min_price, max_val=1_000_000)
+    ok_amt, price, err = sanitize_amount(
+        update.message.text.strip(), min_val=min_price, max_val=1_000_000, lang=lang
+    )
     if not ok_amt:
         await update.message.reply_text(err)
         return True
@@ -300,6 +314,7 @@ async def prompt_qty_input(
         user = (
             await session.execute(select(User).where(User.telegram_id == user_id))
         ).scalar_one_or_none()
+        lang = get_user_lang(user)
         balance = user.balance if user else 0
         fee_rate = _get_effective_promo_fee(user)
 
@@ -310,13 +325,15 @@ async def prompt_qty_input(
     context.user_data["awaiting_promo_qty"] = True
 
     fee_pct = round(fee_rate * 100, 1)
-    text = f"{esc(error_msg)}\n\n" if error_msg else ""
-    text += (
-        f"🔔 <b>تنبيه: العمولة المطبقة لحسابك هي {fee_pct}%.</b>\n\n"
-        f"💵 <b>سعر التنفيذ الواحد:</b> {price:,} غرام\n"
-        f"💰 <b>رصيدك:</b> {balance:,} غرام\n\n"
-        f"📝 <b>اكتب عدد التنفيذات المطلوب (أدنى حد 3)، أو اختر:</b>\n"
-        f"<b>الحد الأقصى لرصيدك:</b> {max_qty}"
+    error_prefix = f"{esc(error_msg)}\n\n" if error_msg else ""
+    text = get_text(
+        lang,
+        "promo_qty_prompt",
+        error_prefix=error_prefix,
+        fee_pct=fee_pct,
+        price=price,
+        balance=balance,
+        max_qty=max_qty,
     )
 
     keyboard = []
@@ -331,9 +348,14 @@ async def prompt_qty_input(
         if row:
             keyboard.append(row)
         keyboard.append(
-            [InlineKeyboardButton(f"(الحد الأقصى لرصيدك) {max_qty}", callback_data=f"qty_select_{max_qty}")]
+            [
+                InlineKeyboardButton(
+                    get_text(lang, "promo_btn_max_qty", max_qty=max_qty),
+                    callback_data=f"qty_select_{max_qty}",
+                )
+            ]
         )
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")])
 
     markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
@@ -346,11 +368,14 @@ async def process_promo_qty_text_input(update: Update, context: ContextTypes.DEF
     if not context.user_data.get("awaiting_promo_qty"):
         return False
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
-    ok_amt, qty, err = sanitize_amount(update.message.text.strip(), min_val=1, max_val=100_000)
+    lang = get_user_lang(db_user)
+    ok_amt, qty, err = sanitize_amount(
+        update.message.text.strip(), min_val=1, max_val=100_000, lang=lang
+    )
     if not ok_amt:
         await update.message.reply_text(err)
         return True
@@ -364,12 +389,18 @@ async def process_qty_input(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     max_qty = context.user_data.get("max_qty", 0)
     price = context.user_data.get("unit_price", 750)
 
+    async with AsyncSessionLocal() as s:
+        u = (
+            await s.execute(select(User).where(User.telegram_id == update.effective_user.id))
+        ).scalar_one_or_none()
+        lang = get_user_lang(u)
+
     if qty < min_qty:
-        err = "❌ خطأ! الحد الأدنى لعدد المشتركين في المهمة – 3."
+        err = get_text(lang, "promo_err_min_qty")
         return await prompt_qty_input(update, context, price, error_msg=err)
 
     if qty > max_qty:
-        err = f"❌ خطأ! الرصيد لا يكفي لإنشاء المهمة بعدد {qty}. الحد الأقصى لرصيدك هو {max_qty}."
+        err = get_text(lang, "promo_err_max_qty", qty=qty, max_qty=max_qty)
         return await prompt_qty_input(update, context, price, error_msg=err)
 
     context.user_data.pop("awaiting_promo_qty", None)
@@ -381,40 +412,71 @@ async def prompt_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     qty = context.user_data.get("task_qty", 3)
     price = context.user_data.get("unit_price", 750)
+    base_cost = qty * price
+    applied_code = context.user_data.get("promo_applied_code")
 
+    promo_obj = None
     async with AsyncSessionLocal() as session:
         user = (
             await session.execute(select(User).where(User.telegram_id == user_id))
         ).scalar_one_or_none()
+        lang = get_user_lang(user)
         fee_rate = _get_effective_promo_fee(user)
+        if applied_code:
+            ok_p, p_candidate, _ = await validate_promo_code(session, user_id, applied_code, base_cost)
+            if ok_p and p_candidate:
+                promo_obj = p_candidate
+            else:
+                context.user_data.pop("promo_applied_code", None)
+                applied_code = None
 
-    base_cost = qty * price
-    total_gram = math.ceil(base_cost * (1.0 + fee_rate))
+    pricing = calculate_campaign_pricing(base_cost, fee_rate, promo_obj)
+    total_gram = pricing["final_total"]
     context.user_data["total_gram"] = total_gram
     context.user_data["promo_fee_rate"] = fee_rate
 
     fee_pct = round(fee_rate * 100, 1)
-    text = (
-        f"💳 <b>اختر طريقة الدفع لمهمتك:</b>\n\n"
-        f"• التكلفة الصافية: <code>{base_cost:,}</code> غرام\n"
-        f"• العمولة المطبقة ({fee_pct}%): <code>{total_gram - base_cost:,}</code> غرام\n"
-        f"• <b>الإجمالي:</b> <code>{total_gram:,}</code> غرام\n\n"
-        f"💡 يمكنك التبرع بـ <b>{STARS_FEE_FREE_COST} ⭐</b> لإلغاء العمولة نهائياً لمدة 24 ساعة!"
+    discount_line = ""
+    if promo_obj and pricing["discount"] > 0:
+        discount_line = get_text(
+            lang,
+            "promo_payment_discount_line",
+            code=esc(promo_obj.code),
+            discount=pricing["discount"],
+        )
+
+    text = get_text(
+        lang,
+        "promo_payment_method",
+        base_cost=base_cost,
+        fee_pct=fee_pct,
+        commission=pricing["original_commission"],
+        discount_line=discount_line,
+        total_gram=total_gram,
+        stars_cost=STARS_FEE_FREE_COST,
     )
 
     keyboard = [
-        [InlineKeyboardButton(f"💎 دفع {total_gram:,} GRAM", callback_data="pay_method_gram")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_pay_gram", total_gram=total_gram), callback_data="pay_method_gram")],
     ]
+    if applied_code and promo_obj:
+        keyboard.append(
+            [InlineKeyboardButton(get_text(lang, "promo_btn_clear_code", code=applied_code), callback_data="promo_clear_code")]
+        )
+    else:
+        keyboard.append(
+            [InlineKeyboardButton(get_text(lang, "promo_btn_enter_code"), callback_data="promo_enter_code")]
+        )
     if fee_rate > 0:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    f"🌟 دفع {STARS_FEE_FREE_COST} Telegram Stars (إعفاء عمولة 24س)",
+                    get_text(lang, "promo_btn_pay_stars", stars_cost=STARS_FEE_FREE_COST),
                     callback_data="pay_method_stars",
                 )
             ]
         )
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")])
 
     markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
@@ -424,11 +486,84 @@ async def prompt_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
-async def handle_stars_fee_free_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+async def prompt_promo_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
+    query = update.callback_query
+    await query.answer()
+    context.user_data["awaiting_promo_code"] = True
+    await query.edit_message_text(
+        get_text(lang, "promo_code_prompt"),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")]]
+        ),
+    )
+
+
+async def clear_promo_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, db_user = await enforce_user_access(update, context)
+    if not ok:
+        return
+
+    lang = get_user_lang(db_user)
+    context.user_data.pop("promo_applied_code", None)
+    await update.callback_query.answer(get_text(lang, "promo_code_cleared"), show_alert=True)
+    await prompt_payment_method(update, context)
+
+
+async def process_promo_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.user_data.get("awaiting_promo_code"):
+        return False
+
+    ok, db_user = await enforce_user_access(update, context)
+    if not ok:
+        return True
+
+    user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
+    code_raw = update.message.text.strip().upper()
+    context.user_data.pop("awaiting_promo_code", None)
+
+    qty = context.user_data.get("task_qty", 3)
+    price = context.user_data.get("unit_price", 750)
+    base_cost = qty * price
+
+    async with AsyncSessionLocal() as session:
+        user = (
+            await session.execute(select(User).where(User.telegram_id == user_id))
+        ).scalar_one_or_none()
+        fee_rate = _get_effective_promo_fee(user)
+        ok_p, promo, err_key = await validate_promo_code(session, user_id, code_raw, base_cost)
+
+    if not ok_p or not promo:
+        if err_key == "promo_err_min_order" and promo:
+            msg = get_text(lang, err_key, min_order=promo.min_order_grams or 0)
+        else:
+            msg = get_text(lang, err_key or "promo_err_invalid")
+        await update.message.reply_text(msg, parse_mode="HTML")
+        await prompt_payment_method(update, context)
+        return True
+
+    pricing = calculate_campaign_pricing(base_cost, fee_rate, promo)
+    context.user_data["promo_applied_code"] = promo.code
+    await update.message.reply_text(
+        get_text(lang, "promo_code_applied", code=esc(promo.code), discount=pricing["discount"]),
+        parse_mode="HTML",
+    )
+    await prompt_payment_method(update, context)
+    return True
+
+
+async def handle_stars_fee_free_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, db_user = await enforce_user_access(update, context)
+    if not ok:
+        return
+
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     await query.answer()
@@ -436,17 +571,17 @@ async def handle_stars_fee_free_payment(update: Update, context: ContextTypes.DE
     try:
         await context.bot.send_invoice(
             chat_id=user_id,
-            title="إعفاء عمولة الترويج 24 ساعة",
-            description="إلغاء كامل عمولة إنشاء الحملات الترويجية لمدة 24 ساعة في ZetaGram.",
+            title=get_text(lang, "promo_stars_title"),
+            description=get_text(lang, "promo_stars_desc"),
             payload=f"stars_feefree_{user_id}",
             provider_token="",
             currency="XTR",
-            prices=[LabeledPrice("إعفاء 24 ساعة", STARS_FEE_FREE_COST)],
+            prices=[LabeledPrice(get_text(lang, "promo_stars_title"), STARS_FEE_FREE_COST)],
         )
     except Exception:
         await context.bot.send_message(
             chat_id=user_id,
-            text="⚠️ الدفع عبر Telegram Stars غير مفعل حالياً، يمكنك الدفع برصيد GRAM مباشرة.",
+            text=get_text(lang, "promo_stars_unavailable"),
         )
 
 
@@ -461,12 +596,14 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
         return
 
     user_id = update.effective_user.id
+    lang = "ar"
     async with user_lock_manager.get_lock(user_id):
         async with AsyncSessionLocal() as session:
             user = (
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if user:
+                lang = get_user_lang(user)
                 user.fee_free_until = utcnow() + timedelta(hours=24)
                 await session.commit()
 
@@ -476,18 +613,18 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     context.user_data["promo_fee_rate"] = 0.0
 
     await update.message.reply_text(
-        "🌟 <b>تم تفعيل الإعفاء من العمولة لمدة 24 ساعة بنجاح!</b>\n"
-        f"أصبحت تكلفة حملتك بدون عمولة: <code>{qty * price:,}</code> غرام.",
+        get_text(lang, "promo_stars_activated", total=qty * price),
         parse_mode="HTML",
     )
     await prompt_target_chat_picker(update, context)
 
 
 async def prompt_target_chat_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     if query:
         await query.answer()
@@ -497,20 +634,13 @@ async def prompt_target_chat_picker(update: Update, context: ContextTypes.DEFAUL
 
     if cat in ("channel", "group"):
         is_ch = cat == "channel"
-        kind_ar = "القناة" if is_ch else "المجموعة"
-        text = (
-            f"📌 <b>تحديد {kind_ar} المستهدفة:</b>\n\n"
-            f"⚠️ <b>يجب أن يكون البوت مشرفاً في {kind_ar} للتحقق من اشتراكات الأعضاء.</b>\n\n"
-            f"1️⃣ اضغط زر «📣 اختيار {kind_ar}» أدناه لاختيارها فوراً.\n"
-            f"2️⃣ أو أرسل بياناتها يدوياً بالصيغة:\n"
-            f"<code>@username_أو_الرابط | اسم الحملة</code>\n"
-            f"مثال: <code>@MyChannel | قناتي التقنية</code>"
-        )
+        kind_label = get_text(lang, "promo_kind_channel" if is_ch else "promo_kind_group")
+        text = get_text(lang, "promo_target_chat_prompt", kind=kind_label)
         req_kb = ReplyKeyboardMarkup(
             [
                 [
                     KeyboardButton(
-                        f"📣 اختيار {kind_ar}",
+                        get_text(lang, "promo_btn_pick_chat", kind=kind_label),
                         request_chat=KeyboardButtonRequestChat(
                             request_id=1, chat_is_channel=is_ch
                         ),
@@ -533,13 +663,8 @@ async def prompt_target_chat_picker(update: Update, context: ContextTypes.DEFAUL
         elif cat == "reaction_fixed":
             extra_hint = " | 👍"
 
-        text = (
-            f"🔗 <b>أدخل رابط المهمة وعنوانها:</b>\n\n"
-            f"أرسل البيانات مفصولة بـ <code>|</code> بالصيغة التالية:\n"
-            f"<code>الرابط | عنوان المهمة{extra_hint}</code>\n\n"
-            f"مثال:\n<code>https://t.me/my_target/15 | دعم منشور مهم{extra_hint}</code>"
-        )
-        kb = [[InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")]]
+        text = get_text(lang, "promo_target_url_prompt", extra_hint=extra_hint)
+        kb = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")]]
         if query:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         else:
@@ -550,10 +675,11 @@ async def handle_chat_shared_message(update: Update, context: ContextTypes.DEFAU
     if not context.user_data.get("awaiting_promo_target"):
         return
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     shared = update.message.chat_shared
     if not shared:
         return
@@ -562,13 +688,12 @@ async def handle_chat_shared_message(update: Update, context: ContextTypes.DEFAU
     is_admin, status = await check_bot_is_admin(context.bot, chat_id)
     if not is_admin:
         await update.message.reply_text(
-            f"❌ <b>البوت ليس مشرفاً في هذه المحادثة!</b> (الحالة: <code>{esc(status)}</code>)\n"
-            f"يرجى رفع البوت كمشرف أولاً ثم اختيار المحادثة مجدداً.",
+            get_text(lang, "promo_err_bot_not_admin", status=esc(status)),
             parse_mode="HTML",
         )
         return
 
-    title = f"محادثة {chat_id}"
+    title = f"Chat {chat_id}"
     target_url = ""
     chat_ref = str(chat_id)
     try:
@@ -587,7 +712,7 @@ async def handle_chat_shared_message(update: Update, context: ContextTypes.DEFAU
 
     if not target_url:
         await update.message.reply_text(
-            "⚠️ تعذر جلب رابط دعوة للمحادثة تلقائياً. يرجى إرسال الرابط والاسم يدوياً: <code>الرابط | الاسم</code>",
+            get_text(lang, "promo_err_invite_fetch"),
             parse_mode="HTML",
         )
         return
@@ -596,26 +721,28 @@ async def handle_chat_shared_message(update: Update, context: ContextTypes.DEFAU
     context.user_data["promo_chat_id"] = chat_ref
     context.user_data["promo_title"] = title[:120]
     context.user_data["promo_extra"] = ""
+    context.user_data["promo_message_id"] = None
+    context.user_data["promo_auto_verify_reactions"] = False
     context.user_data.pop("awaiting_promo_target", None)
 
-    await update.message.reply_text("✅ تم التحقق من المحادثة بنجاح!", reply_markup=ReplyKeyboardRemove())
-    await show_promo_confirmation(update, context)
+    await update.message.reply_text(get_text(lang, "promo_chat_verified"), reply_markup=ReplyKeyboardRemove())
+    await show_promo_confirmation(update, context, lang=lang)
 
 
 async def process_promo_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not context.user_data.get("awaiting_promo_target"):
         return False
 
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
+    lang = get_user_lang(db_user)
     raw = update.message.text.strip()
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) < 2 or not parts[0] or not parts[1]:
         await update.message.reply_text(
-            "⚠️ يرجى الإدخال بالصيغة الصحيحة مفصولة بـ <code>|</code>:\n"
-            "<code>@username_أو_الرابط | عنوان المهمة</code>",
+            get_text(lang, "promo_err_target_format"),
             parse_mode="HTML",
         )
         return True
@@ -626,43 +753,64 @@ async def process_promo_target_input(update: Update, context: ContextTypes.DEFAU
 
     cat = context.user_data.get("promo_category", "channel")
     chat_id = None
+    msg_id = None
+    auto_verify_reactions = False
+
     if target_in.startswith("@"):
         chat_id = target_in
         target_url = f"https://t.me/{target_in.lstrip('@')}"
     elif target_in.startswith("http://") or target_in.startswith("https://"):
         target_url = target_in
-        if "t.me/" in target_in:
-            slug = target_in.split("t.me/", 1)[1].split("/", 1)[0].split("?", 1)[0]
-            if slug and not slug.startswith("+") and slug != "c":
-                chat_id = f"@{slug}"
+        if "t.me/" in target_in or "telegram.me/" in target_in:
+            parsed_chat, parsed_msg = parse_telegram_post_link(target_url)
+            if parsed_chat:
+                chat_id = parsed_chat
+                msg_id = parsed_msg
+            elif "t.me/" in target_in:
+                slug = target_in.split("t.me/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+                if slug and not slug.startswith("+") and slug != "c":
+                    chat_id = f"@{slug}"
     else:
-        await update.message.reply_text("❌ يرجى إدخال رابط يبدأ بـ https:// أو معرف يبدأ بـ @.")
+        await update.message.reply_text(get_text(lang, "promo_err_bad_url"))
         return True
 
     if cat in ("channel", "group"):
         if not chat_id:
-            await update.message.reply_text("❌ يجب استخدام معرف عام (@username) أو زر اختيار القناة للتحقق.")
+            await update.message.reply_text(get_text(lang, "promo_err_need_public_chat"))
             return True
         is_admin, status = await check_bot_is_admin(context.bot, chat_id)
         if not is_admin:
             await update.message.reply_text(
-                f"❌ <b>البوت ليس مشرفاً في {esc(chat_id)}!</b> ({esc(status)})\n"
-                f"ارفع البوت كمشرف أولاً ثم أعد المحاولة.",
+                get_text(lang, "promo_err_bot_not_admin", status=esc(status)),
                 parse_mode="HTML",
             )
             return True
+    elif cat in ("reaction_random", "reaction_fixed") and chat_id and msg_id:
+        is_admin, _ = await check_bot_is_admin(context.bot, chat_id)
+        if is_admin:
+            try:
+                chat_obj = await context.bot.get_chat(chat_id)
+                if getattr(chat_obj, "id", None):
+                    chat_id = str(chat_obj.id)
+            except Exception:
+                pass
+            auto_verify_reactions = True
 
     context.user_data["promo_target_url"] = target_url
     context.user_data["promo_chat_id"] = chat_id
+    context.user_data["promo_message_id"] = msg_id
+    context.user_data["promo_auto_verify_reactions"] = auto_verify_reactions
     context.user_data["promo_title"] = title
     context.user_data["promo_extra"] = extra
     context.user_data.pop("awaiting_promo_target", None)
 
-    await show_promo_confirmation(update, context)
+    await show_promo_confirmation(update, context, lang=lang)
     return True
 
 
-async def show_promo_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_promo_confirmation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str = "ar"
+):
     cat = context.user_data.get("promo_category", "channel")
     qty = context.user_data.get("task_qty", 3)
     price = context.user_data.get("unit_price", 750)
@@ -670,20 +818,30 @@ async def show_promo_confirmation(update: Update, context: ContextTypes.DEFAULT_
     title = context.user_data.get("promo_title", "")
     url = context.user_data.get("promo_target_url", "")
     langs = context.user_data.get("promo_langs", [])
+    auto_rx = bool(context.user_data.get("promo_auto_verify_reactions", False))
 
-    text = (
-        f"📋 <b>مراجعة وتأكيد الحملة الترويجية:</b>\n\n"
-        f"📌 <b>العنوان:</b> {esc(title)}\n"
-        f"📂 <b>الفئة:</b> <code>{esc(cat)}</code>\n"
-        f"🔗 <b>الرابط:</b> {esc(url)}\n"
-        f"👥 <b>العدد المطلوب:</b> <code>{qty:,}</code>\n"
-        f"💵 <b>مكافأة المنفذ:</b> <code>{price:,}</code> غرام\n"
-        f"🌍 <b>الجمهور:</b> {esc(', '.join(langs) if langs else 'الجميع')}\n"
-        f"💳 <b>التكلفة الإجمالية المخصومة:</b> <code>{total_gram:,}</code> غرام (محفوظة بالضمان المالي Escrow)"
+    rx_badge = ""
+    if cat in ("reaction_random", "reaction_fixed"):
+        rx_badge = get_text(
+            lang, "promo_auto_rx_badge_on" if auto_rx else "promo_auto_rx_badge_off"
+        )
+
+    audience = esc(", ".join(langs)) if langs else get_text(lang, "promo_audience_all")
+    text = get_text(
+        lang,
+        "promo_confirm_summary",
+        title=esc(title),
+        cat=esc(cat),
+        url=esc(url),
+        qty=qty,
+        price=price,
+        audience=audience,
+        rx_badge=rx_badge,
+        total_gram=total_gram,
     )
     keyboard = [
-        [InlineKeyboardButton("✅ تأكيد وإنشاء الحملة الآن", callback_data="promo_confirm_create")],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="promo_back_main")],
+        [InlineKeyboardButton(get_text(lang, "promo_btn_confirm_create"), callback_data="promo_confirm_create")],
+        [InlineKeyboardButton(get_text(lang, "btn_cancel"), callback_data="promo_back_main")],
     ]
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True
@@ -691,10 +849,11 @@ async def show_promo_confirmation(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def promo_confirm_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
 
@@ -703,32 +862,70 @@ async def promo_confirm_create_callback(update: Update, context: ContextTypes.DE
     price = context.user_data.get("unit_price")
     url = context.user_data.get("promo_target_url")
     chat_id = context.user_data.get("promo_chat_id")
+    msg_id = context.user_data.get("promo_message_id")
+    auto_rx = bool(context.user_data.get("promo_auto_verify_reactions", False))
     title = context.user_data.get("promo_title")
     extra = context.user_data.get("promo_extra", "")
     langs = context.user_data.get("promo_langs", [])
     acc_type = context.user_data.get("promo_acc_type", "all")
+    applied_code = context.user_data.get("promo_applied_code")
 
     if not cat or not qty or not price or not url or not title:
-        await query.answer("❌ انتهت بيانات الحملة، يرجى البدء من جديد.", show_alert=True)
+        await query.answer(get_text(lang, "promo_err_expired_session"), show_alert=True)
         return
 
-    async with user_lock_manager.get_lock(user_id):
+    locks = [("user", user_id)]
+    if applied_code:
+        locks.append(("promo", applied_code))
+
+    async with user_lock_manager.acquire_ordered_locks(*locks):
         async with AsyncSessionLocal() as session:
             user = (
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user:
-                await query.answer("❌ خطأ في الحساب.", show_alert=True)
+                await query.answer(get_text(lang, "account_error"), show_alert=True)
                 return
 
+            lang = get_user_lang(user)
             fee_rate = _get_effective_promo_fee(user)
             escrow = qty * price
-            total_cost = math.ceil(escrow * (1.0 + fee_rate))
-            commission = total_cost - escrow
+
+            promo_obj = None
+            if applied_code:
+                ok_p, p_cand, _ = await validate_promo_code(session, user_id, applied_code, escrow)
+                if not ok_p or not p_cand:
+                    context.user_data.pop("promo_applied_code", None)
+                    await query.answer(get_text(lang, "promo_err_code_race"), show_alert=True)
+                    return
+                promo_obj = p_cand
+
+            pricing = calculate_campaign_pricing(escrow, fee_rate, promo_obj)
+            total_cost = pricing["final_total"]
+            commission = pricing["commission_paid"]
+            promo_subsidy = pricing["promo_subsidy"]
 
             if user.balance < total_cost:
-                await query.answer("❌ رصيدك غير كافٍ الآن!", show_alert=True)
+                await query.answer(get_text(lang, "promo_err_insufficient"), show_alert=True)
                 return
+
+            if promo_obj:
+                upd_promo = await session.execute(
+                    sa_update(PromoCode)
+                    .where(
+                        and_(
+                            PromoCode.id == promo_obj.id,
+                            PromoCode.is_active == True,
+                            PromoCode.used_count < PromoCode.max_uses,
+                        )
+                    )
+                    .values(used_count=PromoCode.used_count + 1)
+                )
+                if upd_promo.rowcount != 1:
+                    await session.rollback()
+                    context.user_data.pop("promo_applied_code", None)
+                    await query.answer(get_text(lang, "promo_err_code_race"), show_alert=True)
+                    return
 
             user.balance -= total_cost
             new_task = Task(
@@ -747,8 +944,24 @@ async def promo_confirm_create_callback(update: Update, context: ContextTypes.DE
                 commission_paid=commission,
                 bot_username=extra if cat.startswith("bot_") and extra else None,
                 required_emoji=extra if cat == "reaction_fixed" and extra else None,
+                target_message_id=msg_id,
+                auto_verify_reactions=auto_rx,
+                promo_code_used=promo_obj.code if promo_obj else None,
+                promo_subsidy=promo_subsidy,
             )
             session.add(new_task)
+            await session.flush()
+
+            if promo_obj:
+                session.add(
+                    PromoCodeRedemption(
+                        promo_code_id=promo_obj.id,
+                        user_id=user_id,
+                        task_id=new_task.id,
+                        discount_grams=pricing["discount"],
+                    )
+                )
+
             session.add(
                 Transaction(
                     user_id=user_id,
@@ -763,19 +976,18 @@ async def promo_confirm_create_callback(update: Update, context: ContextTypes.DE
     for k in [
         "promo_category", "promo_acc_type", "promo_langs", "min_price",
         "unit_price", "max_qty", "task_qty", "total_gram", "promo_fee_rate",
-        "promo_target_url", "promo_chat_id", "promo_title", "promo_extra",
+        "promo_target_url", "promo_chat_id", "promo_message_id",
+        "promo_auto_verify_reactions", "promo_title", "promo_extra",
+        "promo_applied_code", "awaiting_promo_code",
     ]:
         context.user_data.pop(k, None)
 
-    await query.answer("🎉 تم إطلاق حملتك الترويجية بنجاح!", show_alert=True)
+    await query.answer(get_text(lang, "promo_created_alert"), show_alert=True)
     await query.edit_message_text(
-        f"🚀 <b>تم إطلاق الحملة (#{task_id}) بنجاح!</b>\n\n"
-        f"📌 <b>العنوان:</b> {esc(title)}\n"
-        f"🛡️ <b>الضمان المالي (Escrow):</b> <code>{escrow:,}</code> غرام\n\n"
-        f"يمكنك متابعتها وإدارتها في أي وقت من قسم «💼 مهامي وإدارتها».",
+        get_text(lang, "promo_created_msg", task_id=task_id, title=esc(title), escrow=escrow),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💼 عرض حملاتي", callback_data="promo_my_tasks")]]
+            [[InlineKeyboardButton(get_text(lang, "promo_btn_view_my"), callback_data="promo_my_tasks")]]
         ),
     )
 
@@ -785,35 +997,39 @@ async def show_promo_auto_settings(update: Update, context: ContextTypes.DEFAULT
     if not ok:
         return
 
+    lang = get_user_lang(user)
     query = update.callback_query
     await query.answer()
 
-    perks = get_vip_perks(user.vip_level if user else 1)
+    vip_lvl = user.vip_level if user else 1
+    perks = get_vip_perks(vip_lvl)
+    level_title = get_vip_title(lang, vip_lvl)
     vip_fee = round(perks["promo_fee"] * 100, 1)
     now = utcnow()
     if user and user.fee_free_until and now < user.fee_free_until:
-        stars_status = f"🟢 مفعل حتى <code>{user.fee_free_until.strftime('%Y-%m-%d %H:%M UTC')}</code> (عمولة 0%)"
+        stars_status = get_text(
+            lang, "promo_stars_on", until=user.fee_free_until.strftime("%Y-%m-%d %H:%M")
+        )
     else:
-        stars_status = "⚪ غير مفعل حالياً"
+        stars_status = get_text(lang, "promo_stars_off")
 
-    text = (
-        f"⚙️ <b>إعدادات الترويج والعمولة:</b>\n\n"
-        f"🏅 <b>مستواك:</b> {esc(perks['title'])}\n"
-        f"📉 <b>عمولة الترويج لمستواك:</b> <code>{vip_fee}%</code>\n"
-        f"🌟 <b>إعفاء العمولة عبر Telegram Stars:</b> {stars_status}\n\n"
-        f"🛡️ <b>نظام الضمان المالي (Escrow):</b>\n"
-        f"• يتم حجز أجر المنفذين كاملاً داخل الحملة ولا يُصرف إلا بعد التحقق.\n"
-        f"• عند إلغاء أي حملة يُردّ الرصيد المتبقي في الضمان لحسابك فوراً."
+    text = get_text(
+        lang,
+        "promo_settings_view",
+        level_title=esc(level_title),
+        vip_fee=vip_fee,
+        stars_status=stars_status,
     )
-    kb = [[InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")]]
+    kb = [[InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")]]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def show_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     await query.answer()
@@ -830,27 +1046,33 @@ async def show_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     if not user_tasks:
-        text = "💼 <b>مهامي:</b>\n\nليس لديك أي حملات ترويجية قائمة حالياً."
+        text = get_text(lang, "promo_my_empty")
     else:
-        text = "💼 <b>قائمة حملاتك الترويجية (اضغط لإدارة الحملة):</b>\n\n"
+        text = get_text(lang, "promo_my_header")
         for t in user_tasks:
             icon = {"active": "🟢", "paused": "⏸️", "completed": "✅", "cancelled": "🗑️"}.get(t.status, "🔹")
-            text += f"{icon} <b>{esc(t.title)}</b> ({t.completed_qty}/{t.total_qty}) — {t.reward_grams:,} غرام\n"
+            text += f"{icon} <b>{esc(t.title)}</b> ({t.completed_qty}/{t.total_qty}) — {t.reward_grams:,}\n"
             keyboard.append(
-                [InlineKeyboardButton(f"{icon} إدارة: {t.title[:28]}", callback_data=f"mytask_view_{t.id}")]
+                [
+                    InlineKeyboardButton(
+                        get_text(lang, "promo_my_btn_manage", icon=icon, title=t.title[:28]),
+                        callback_data=f"mytask_view_{t.id}",
+                    )
+                ]
             )
 
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="promo_back_main")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="promo_back_main")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def mytask_view_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int | None = None
 ):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     if task_id is None:
@@ -861,44 +1083,52 @@ async def mytask_view_callback(
         t = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
 
     if not t or t.created_by != user_id:
-        await query.answer("❌ الحملة غير موجودة.", show_alert=True)
+        await query.answer(get_text(lang, "promo_err_task_not_found"), show_alert=True)
         return
 
     remaining = max(0, t.total_qty - t.completed_qty)
-    text = (
-        f"💼 <b>إدارة الحملة #{t.id}:</b> {esc(t.title)}\n\n"
-        f"📊 <b>التقدم:</b> <code>{t.completed_qty}/{t.total_qty}</code> (متبقي: {remaining})\n"
-        f"💵 <b>السعر للوحدة:</b> <code>{t.reward_grams:,}</code> غرام\n"
-        f"🛡️ <b>الضمان المتبقي (Escrow):</b> <code>{t.escrow_balance or 0:,}</code> غرام\n"
-        f"📌 <b>الحالة:</b> <code>{esc(t.status)}</code>"
+    text = get_text(
+        lang,
+        "promo_task_view",
+        task_id=t.id,
+        title=esc(t.title),
+        completed=t.completed_qty,
+        total=t.total_qty,
+        remaining=remaining,
+        reward=t.reward_grams,
+        escrow=t.escrow_balance or 0,
+        status=esc(t.status),
     )
     keyboard = []
     if t.status in ("active", "paused"):
-        toggle_label = "⏸️ إيقاف مؤقت" if t.status == "active" else "▶️ استئناف الحملة"
+        toggle_label = get_text(
+            lang, "promo_btn_pause" if t.status == "active" else "promo_btn_resume"
+        )
         keyboard.append([InlineKeyboardButton(toggle_label, callback_data=f"mytask_toggle_{t.id}")])
         if remaining > 0:
             boost_cost = remaining * 100
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"🚀 رفع السعر +100 غرام (بتكلفة {boost_cost:,})",
+                        get_text(lang, "promo_btn_boost", boost_cost=boost_cost),
                         callback_data=f"mytask_boost_{t.id}",
                     )
                 ]
             )
         keyboard.append(
-            [InlineKeyboardButton("🗑️ إلغاء الحملة واسترداد المتبقي", callback_data=f"mytask_cancel_{t.id}")]
+            [InlineKeyboardButton(get_text(lang, "promo_btn_cancel"), callback_data=f"mytask_cancel_{t.id}")]
         )
-    keyboard.append([InlineKeyboardButton("🔙 رجوع لحملاتي", callback_data="promo_my_tasks")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "promo_btn_back_my"), callback_data="promo_my_tasks")])
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def mytask_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     parts = query.data.split("_")
@@ -912,26 +1142,29 @@ async def mytask_action_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not t or t.created_by != user_id or not user:
-                await query.answer("❌ الحملة غير موجودة.", show_alert=True)
+                await query.answer(get_text(lang, "promo_err_task_not_found"), show_alert=True)
                 return
+
+            lang = get_user_lang(user)
 
             if action == "toggle":
                 if t.status not in ("active", "paused"):
-                    await query.answer("⚠️ لا يمكن تغيير حالة حملة منتهية أو ملغاة.", show_alert=True)
+                    await query.answer(get_text(lang, "promo_err_task_closed"), show_alert=True)
                     return
                 t.status = "paused" if t.status == "active" else "active"
                 await session.commit()
-                await query.answer(f"✅ تم تغيير الحالة إلى {t.status}", show_alert=True)
+                await query.answer(get_text(lang, "promo_toggled_alert", status=t.status), show_alert=True)
 
             elif action == "boost":
                 remaining = max(0, t.total_qty - t.completed_qty)
                 if t.status not in ("active", "paused") or remaining <= 0:
-                    await query.answer("⚠️ الحملة غير نشطة أو مكتملة.", show_alert=True)
+                    await query.answer(get_text(lang, "promo_err_boost_closed"), show_alert=True)
                     return
                 extra_cost = remaining * 100
                 if user.balance < extra_cost:
                     await query.answer(
-                        f"❌ رصيدك غير كافٍ! المطلوب {extra_cost:,} غرام.", show_alert=True
+                        get_text(lang, "promo_err_boost_balance", extra_cost=extra_cost),
+                        show_alert=True,
                     )
                     return
                 user.balance -= extra_cost
@@ -946,13 +1179,14 @@ async def mytask_action_callback(update: Update, context: ContextTypes.DEFAULT_T
                     )
                 )
                 await session.commit()
-                await query.answer("🚀 تم رفع سعر المهمة بنجاح!", show_alert=True)
+                await query.answer(get_text(lang, "promo_boosted_alert"), show_alert=True)
 
             elif action == "cancel":
                 if t.status in ("completed", "cancelled"):
-                    await query.answer("⚠️ الحملة مكتملة أو ملغاة بالفعل.", show_alert=True)
+                    await query.answer(get_text(lang, "promo_err_already_closed"), show_alert=True)
                     return
-                refund = max(0, t.escrow_balance or 0)
+                # Subtract any platform-subsidized promo discount to prevent cancel-refund arbitrage
+                refund = max(0, (t.escrow_balance or 0) - (t.promo_subsidy or 0))
                 t.escrow_balance = 0
                 t.status = "cancelled"
                 if refund > 0:
@@ -967,7 +1201,7 @@ async def mytask_action_callback(update: Update, context: ContextTypes.DEFAULT_T
                     )
                 await session.commit()
                 await query.answer(
-                    f"✅ تم إلغاء الحملة واسترداد +{refund:,} غرام لرصيدك!", show_alert=True
+                    get_text(lang, "promo_cancelled_alert", refund=refund), show_alert=True
                 )
 
     await mytask_view_callback(update, context, task_id=task_id)

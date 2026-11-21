@@ -6,44 +6,22 @@ from sqlalchemy import select, func
 from database.db import AsyncSessionLocal
 from database.models import Transaction
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang, get_tx_type_label
 from utils.html_utils import esc
 
 TX_PAGE_SIZE = 10
-
-TYPE_ICONS = {
-    "earn_task": "🧑‍💻 كسب مهمة",
-    "spend_promo": "📣 إنشاء ترويج",
-    "promo_refund": "↩️ استرداد ترويج",
-    "voucher_claim": "🎁 استبدال شيك",
-    "voucher_create": "🏷️ إنشاء شيك",
-    "voucher_refund": "↩️ استرداد شيك",
-    "transfer_send": "💸 تحويل مرسل",
-    "transfer_receive": "📥 تحويل مستلم",
-    "daily_bonus": "🎁 مكافأة يومية",
-    "daily_quest": "🎯 تحدي يومي",
-    "spin": "🎡 عجلة الحظ",
-    "admin_adjust": "⚙️ تعديل أدمن",
-    "reward": "🏅 مكافأة",
-    "referral_milestone": "👥 مكافأة إحالة",
-    "referral_commission": "💎 عمولة إحالة",
-    "vault_deposit": "🏛️ إيداع خزنة",
-    "vault_withdraw": "💰 سحب خزنة",
-    "raffle_buy": "🎫 شراء تذكرة",
-    "raffle_win": "🏆 فوز يانصيب",
-    "unsub_penalty": "⚠️ خصم إلغاء اشتراك",
-    "leaderboard_prize": "🏆 جائزة متصدرين",
-}
 
 
 async def show_transaction_history(
     update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1
 ):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     query = update.callback_query
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     if query:
         await query.answer()
 
@@ -66,31 +44,43 @@ async def show_transaction_history(
         transactions = result.scalars().all()
 
     if not transactions:
-        text = "📜 <b>سجل المعاملات:</b>\n\nلا توجد معاملات مسجلة في حسابك حتى الآن."
+        text = get_text(lang, "history_empty")
     else:
-        text = f"📜 <b>سجل المعاملات (صفحة {page}/{total_pages}):</b>\n\n"
+        text = get_text(lang, "history_title", page=page, total_pages=total_pages)
         for tx in transactions:
-            icon = TYPE_ICONS.get(tx.trans_type, "💰 معاملة")
+            icon = get_tx_type_label(lang, tx.trans_type)
             sign = "+" if tx.amount > 0 else ""
             dt_str = tx.created_at.strftime("%Y-%m-%d %H:%M")
-            text += f"{icon}\n"
-            text += f"🔹 المبلغ: <code>{sign}{tx.amount:,}</code> غرام\n"
-            if tx.description:
-                text += f"💬 التفاصيل: {esc(tx.description)}\n"
-            text += f"⏱️ التاريخ: {dt_str}\n"
-            text += "─────────────────\n"
+            details_line = (
+                get_text(lang, "history_details_line", desc=esc(tx.description))
+                if tx.description
+                else ""
+            )
+            text += get_text(
+                lang,
+                "history_row",
+                icon=icon,
+                sign=sign,
+                amount=tx.amount,
+                details_line=details_line,
+                dt_str=dt_str,
+            )
 
     keyboard = []
     if total_pages > 1:
         nav_row = []
         if page > 1:
-            nav_row.append(InlineKeyboardButton("◀️ السابق", callback_data=f"tx_page_{page - 1}"))
+            nav_row.append(
+                InlineKeyboardButton(get_text(lang, "history_btn_prev"), callback_data=f"tx_page_{page - 1}")
+            )
         nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="ignore"))
         if page < total_pages:
-            nav_row.append(InlineKeyboardButton("التالي ▶️", callback_data=f"tx_page_{page + 1}"))
+            nav_row.append(
+                InlineKeyboardButton(get_text(lang, "history_btn_next"), callback_data=f"tx_page_{page + 1}")
+            )
         keyboard.append(nav_row)
 
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")])
     markup = InlineKeyboardMarkup(keyboard)
 
     if query:

@@ -9,6 +9,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, Task, UserTask, Transaction
 from utils.telegram_api import check_user_subscription_status
 from utils.security import user_lock_manager, send_security_alert
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc, utcnow
 
 
@@ -63,9 +64,10 @@ async def check_unsubs_once(bot: Bot, sleep_between: float = 0.08) -> dict:
                 )
         elif status == "not_member":
             deducted = 0
-            ban_duration = ""
+            ban_dur_key = ""
             violations = 0
             title_snap = task_title
+            user_lang = "ar"
 
             async with user_lock_manager.acquire_ordered_locks(("user", uid), ("task", tid)):
                 async with AsyncSessionLocal() as session:
@@ -74,6 +76,7 @@ async def check_unsubs_once(bot: Bot, sleep_between: float = 0.08) -> dict:
                     user = (await session.execute(select(User).where(User.telegram_id == uid))).scalar_one_or_none()
 
                     if ut and task and user and not ut.unsubscribed:
+                        user_lang = get_user_lang(user)
                         ut.unsubscribed = True
                         penalty_base = ut.reward_paid or task.reward_grams
                         deducted = min(user.balance, penalty_base)
@@ -84,13 +87,13 @@ async def check_unsubs_once(bot: Bot, sleep_between: float = 0.08) -> dict:
 
                         if violations == 1:
                             user.banned_until = now + timedelta(hours=24)
-                            ban_duration = "24 ساعة"
+                            ban_dur_key = "ban_dur_24h"
                         elif violations == 2:
                             user.banned_until = now + timedelta(days=7)
-                            ban_duration = "7 أيام"
+                            ban_dur_key = "ban_dur_7d"
                         else:
                             user.banned_until = now + timedelta(days=36500)
-                            ban_duration = "دائم"
+                            ban_dur_key = "ban_dur_perm"
 
                         # Re-open 1 slot on the task & restore escrow
                         task.completed_qty = max(0, task.completed_qty - 1)
@@ -110,14 +113,15 @@ async def check_unsubs_once(bot: Bot, sleep_between: float = 0.08) -> dict:
                         await session.commit()
                         stats["penalized"] += 1
 
-            if ban_duration:
+            if ban_dur_key:
                 try:
-                    msg = (
-                        f"⚠️ <b>تنبيه مخالفة وحظر!</b>\n\n"
-                        f"لقد قمت بإلغاء الاشتراك من القناة/المجموعة: <code>{esc(title_snap)}</code> قبل مرور 7 أيام.\n"
-                        f"• 🔴 تم خصم <b>-{deducted:,}</b> غرام من رصيدك.\n"
-                        f"• 🚫 تم فرض حظر من تنفيذ المهام لمدة: <b>{ban_duration}</b>.\n"
-                        f"• ⚠️ عدد المخالفات المسجلة عليك: {violations}"
+                    msg = get_text(
+                        user_lang,
+                        "notif_unsub_penalty",
+                        title=esc(title_snap),
+                        deducted=deducted,
+                        duration=get_text(user_lang, ban_dur_key),
+                        violations=violations,
                     )
                     await bot.send_message(chat_id=uid, text=msg, parse_mode="HTML")
                 except TelegramError:

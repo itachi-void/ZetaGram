@@ -206,7 +206,7 @@ async def detect_suspicious_transfer(
 
 
 def sanitize_amount(
-    val: str, min_val: int = 1, max_val: int = 1_000_000_000
+    val: str, min_val: int = 1, max_val: int = 1_000_000_000, lang: str = "ar"
 ) -> Tuple[bool, int, str]:
     """
     Sanitize integer amounts to prevent negative values, zero, or overflow attacks.
@@ -216,12 +216,12 @@ def sanitize_amount(
         val_clean = str(val).strip()
         num = int(val_clean)
         if num < min_val:
-            return False, 0, f"❌ المبلغ يجب أن يكون {min_val:,} على الأقل."
+            return False, 0, get_text(lang, "err_amount_min", min_val=min_val)
         if num > max_val:
-            return False, 0, f"❌ المبلغ يتجاوز الحد الأقصى المسموح به ({max_val:,})."
+            return False, 0, get_text(lang, "err_amount_max", max_val=max_val)
         return True, num, ""
     except (ValueError, TypeError):
-        return False, 0, "❌ يرجى إدخال رقم صحيح."
+        return False, 0, get_text(lang, "err_amount_invalid")
 
 
 def generate_math_captcha(lang: str = "ar"):

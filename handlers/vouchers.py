@@ -11,6 +11,7 @@ from database.db import AsyncSessionLocal
 from database.models import User, UserTask, Voucher, VoucherRedemption, Transaction
 from utils.security import user_lock_manager, sanitize_amount, send_security_alert
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc, utcnow
 
 
@@ -21,27 +22,23 @@ def generate_voucher_code(length: int = 8) -> str:
 
 
 async def show_vouchers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     if query:
         await query.answer()
 
-    text = (
-        "🏷️ <b>قسم الشيكات والكوبونات:</b>\n\n"
-        "يمكنك استبدال الشيكات التي تملكها أو إنشاء شيكات هدايا لأصدقائك أو لقناتك خصماً من رصيدك.\n\n"
-        "يمكنك أيضاً استخدام التعليمة السريعة للإنشاء:\n"
-        "<code>/createvoucher &lt;المبلغ&gt; &lt;عدد_الاستخدامات&gt;</code>"
-    )
+    text = get_text(lang, "vouchers_menu")
     keyboard = [
         [
-            InlineKeyboardButton("🎁 استبدال شيك", callback_data="prompt_redeem_voucher"),
-            InlineKeyboardButton("➕ إنشاء شيك جديد", callback_data="prompt_create_voucher"),
+            InlineKeyboardButton(get_text(lang, "vouchers_btn_redeem"), callback_data="prompt_redeem_voucher"),
+            InlineKeyboardButton(get_text(lang, "vouchers_btn_create"), callback_data="prompt_create_voucher"),
         ],
-        [InlineKeyboardButton("📜 شيكاتي المنشأة وإلغاؤها", callback_data="my_created_vouchers")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")],
+        [InlineKeyboardButton(get_text(lang, "vouchers_btn_my"), callback_data="my_created_vouchers")],
+        [InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="close_menu")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -52,61 +49,48 @@ async def show_vouchers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def prompt_redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     context.user_data["awaiting_voucher_code"] = True
-    await query.edit_message_text(
-        "🎁 <b>استبدال شيك:</b>\n\n"
-        "يرجى إرسال رمز الشيك في الشات مباشرة (مثال: <code>GRAM-ABCD-1234</code>).",
-        parse_mode="HTML",
-    )
+    await query.edit_message_text(get_text(lang, "voucher_prompt_redeem"), parse_mode="HTML")
 
 
 async def prompt_create_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     await query.answer()
     context.user_data["awaiting_create_voucher"] = True
-    await query.edit_message_text(
-        "➕ <b>إنشاء شيك جديد:</b>\n\n"
-        "يرجى إرسال المبلغ وعدد مرات الاستخدام مفصولة بمسافة:\n"
-        "<code>&lt;المبلغ_لكل_استخدام&gt; &lt;عدد_المستخدمين&gt;</code>\n\n"
-        "مثال: <code>500 10</code> (إنشاء شيك بـ 500 غرام لـ 10 أعضاء).",
-        parse_mode="HTML",
-    )
+    await query.edit_message_text(get_text(lang, "voucher_prompt_create"), parse_mode="HTML")
 
 
 async def handle_create_voucher_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text(
-            "⚠️ <b>الاستخدام الخاطئ!</b>\n"
-            "الصيغة:\n"
-            "<code>/createvoucher &lt;المبلغ&gt; [عدد_الاستخدامات]</code>\n\n"
-            "مثال: <code>/createvoucher 500 5</code>",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(get_text(lang, "voucher_cmd_usage"), parse_mode="HTML")
         return
 
-    ok_amt, amount, err_amt = sanitize_amount(args[0], min_val=1)
+    ok_amt, amount, err_amt = sanitize_amount(args[0], min_val=1, lang=lang)
     if not ok_amt:
         await update.message.reply_text(err_amt)
         return
 
     max_uses = 1
     if len(args) > 1:
-        ok_u, max_uses, err_u = sanitize_amount(args[1], min_val=1, max_val=10_000)
+        ok_u, max_uses, err_u = sanitize_amount(args[1], min_val=1, max_val=10_000, lang=lang)
         if not ok_u:
             await update.message.reply_text(err_u)
             return
@@ -115,25 +99,26 @@ async def handle_create_voucher_command(update: Update, context: ContextTypes.DE
 
 
 async def process_create_voucher_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return True
 
+    lang = get_user_lang(db_user)
     text = update.message.text.strip()
     parts = text.split()
 
     if len(parts) < 1:
-        await update.message.reply_text("❌ يرجى إدخال المبلغ.")
+        await update.message.reply_text(get_text(lang, "voucher_err_enter_amount"))
         return True
 
-    ok_amt, amount, err_amt = sanitize_amount(parts[0], min_val=1)
+    ok_amt, amount, err_amt = sanitize_amount(parts[0], min_val=1, lang=lang)
     if not ok_amt:
         await update.message.reply_text(err_amt)
         return True
 
     max_uses = 1
     if len(parts) > 1:
-        ok_u, max_uses, err_u = sanitize_amount(parts[1], min_val=1, max_val=10_000)
+        ok_u, max_uses, err_u = sanitize_amount(parts[1], min_val=1, max_val=10_000, lang=lang)
         if not ok_u:
             await update.message.reply_text(err_u)
             return True
@@ -147,6 +132,7 @@ async def create_and_send_voucher(
     update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int, max_uses: int
 ):
     user_id = update.effective_user.id
+    lang = "ar"
 
     async with user_lock_manager.get_lock(f"u_{user_id}"):
         total_cost = amount * max_uses
@@ -156,8 +142,10 @@ async def create_and_send_voucher(
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user:
-                await update.message.reply_text("❌ لم يتم العثور على حسابك.")
+                await update.message.reply_text(get_text(lang, "not_registered"))
                 return
+
+            lang = get_user_lang(user)
 
             if user_id not in ADMIN_IDS and (user.vip_level or 1) < 2:
                 completed_cnt = (
@@ -172,17 +160,26 @@ async def create_and_send_voucher(
                 ).scalar() or 0
                 if completed_cnt < MIN_TASKS_FOR_TRANSFER:
                     await update.message.reply_text(
-                        f"🛡️ <b>حماية الحسابات الجديدة:</b>\n"
-                        f"يجب إكمال <b>{MIN_TASKS_FOR_TRANSFER} مهام</b> على الأقل قبل إنشاء الشيكات (مهامك الحالية: {completed_cnt}/{MIN_TASKS_FOR_TRANSFER}).",
+                        get_text(
+                            lang,
+                            "voucher_err_new_account",
+                            min_tasks=MIN_TASKS_FOR_TRANSFER,
+                            completed=completed_cnt,
+                        ),
                         parse_mode="HTML",
                     )
                     return
 
             if user.balance < total_cost:
                 await update.message.reply_text(
-                    f"❌ رصيدك غير كافٍ!\n"
-                    f"المبلغ الإجمالي المطلوب: {total_cost:,} غرام ({amount:,} × {max_uses})\n"
-                    f"رصيدك الحالي: {user.balance:,} غرام"
+                    get_text(
+                        lang,
+                        "voucher_err_insufficient",
+                        total_cost=total_cost,
+                        amount=amount,
+                        max_uses=max_uses,
+                        balance=user.balance,
+                    )
                 )
                 return
 
@@ -210,23 +207,25 @@ async def create_and_send_voucher(
     bot_info = await context.bot.get_me()
     v_link = f"https://t.me/{bot_info.username}?start=v_{code}"
 
-    res_text = (
-        f"🎉 <b>تم إنشاء الشيك بنجاح!</b>\n\n"
-        f"🏷️ <b>رمز الشيك:</b> <code>{esc(code)}</code>\n"
-        f"💰 <b>قيمة الاستخدام:</b> {amount:,} غرام\n"
-        f"👥 <b>الحد الأقصى للاستخدام:</b> {max_uses} أعضاء\n"
-        f"💳 <b>التكلفة المخصومة:</b> {total_cost:,} غرام\n\n"
-        f"🔗 <b>رابط الشيك المباشر:</b>\n<code>{esc(v_link)}</code>"
+    res_text = get_text(
+        lang,
+        "voucher_created",
+        code=esc(code),
+        amount=amount,
+        max_uses=max_uses,
+        total_cost=total_cost,
+        v_link=esc(v_link),
     )
     await update.message.reply_text(res_text, parse_mode="HTML")
 
 
 async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     code = code.strip().upper()
 
     if code.startswith("V_"):
@@ -248,14 +247,12 @@ async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             ).scalar_one_or_none()
             if not user:
                 return
+            lang = get_user_lang(user)
 
             if user.voucher_banned_until and now < user.voucher_banned_until:
                 rem = user.voucher_banned_until - now
                 mins = max(1, int(rem.total_seconds() / 60) + 1)
-                await _send(
-                    f"⛔ <b>تم قفل إدخال الشيكات لمحاولات التخمين!</b>\n"
-                    f"يرجى الانتظار <b>{mins} دقيقة</b> قبل المحاولة مجدداً."
-                )
+                await _send(get_text(lang, "voucher_locked_bruteforce", mins=mins))
                 return
 
             voucher = (
@@ -276,19 +273,17 @@ async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
                         f"🔒 تم قفل استبدال الشيكات له لمدة 15 دقيقة تلقائياً.",
                         alert_key=f"voucher_bf_{user_id}",
                     )
-                    await _send(
-                        "⛔ <b>تم حظر استخدام الشيكات لحسابك لمدة 15 دقيقة بسبب تكرار إدخال أكواد خاطئة!</b>"
-                    )
+                    await _send(get_text(lang, "voucher_locked_now"))
                     return
                 else:
                     await session.commit()
                     await _send(
-                        f"❌ رمز الشيك غير صحيح أو ملغى. (محاولة {user.failed_voucher_attempts}/5)"
+                        get_text(lang, "voucher_invalid_attempt", attempts=user.failed_voucher_attempts)
                     )
                     return
 
             if voucher.used_count >= voucher.max_uses:
-                await _send("⚠️ هذا الشيك تم استخدامه بالكامل بالحد الأقصى.")
+                await _send(get_text(lang, "voucher_exhausted"))
                 return
 
             already_used = (
@@ -301,10 +296,9 @@ async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             ).scalar_one_or_none()
 
             if already_used:
-                await _send("⚠️ لقد قمت باستبدال هذا الشيك مسبقاً!")
+                await _send(get_text(lang, "voucher_already_used"))
                 return
 
-            # Atomic increment preventing multi-user race conditions
             upd = await session.execute(
                 sa_update(Voucher)
                 .where(and_(Voucher.id == voucher.id, Voucher.used_count < Voucher.max_uses))
@@ -312,7 +306,7 @@ async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
             )
             if upd.rowcount != 1:
                 await session.rollback()
-                await _send("⚠️ هذا الشيك تم استخدامه بالكامل بالحد الأقصى.")
+                await _send(get_text(lang, "voucher_exhausted"))
                 return
 
             user.failed_voucher_attempts = 0
@@ -332,19 +326,18 @@ async def redeem_voucher(update: Update, context: ContextTypes.DEFAULT_TYPE, cod
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                await _send("⚠️ لقد قمت باستبدال هذا الشيك مسبقاً!")
+                await _send(get_text(lang, "voucher_already_used"))
                 return
 
-            await _send(
-                f"🎉 تم شحن رصيدك بنجاح بمقدار <b>+{voucher.amount:,} غرام</b>!"
-            )
+            await _send(get_text(lang, "voucher_redeemed_success", amount=voucher.amount))
 
 
 async def show_my_vouchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     if query:
@@ -362,27 +355,31 @@ async def show_my_vouchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     if not vouchers:
-        text = "📜 <b>شيكاتي المنشأة:</b>\n\nلم تقم بإنشاء أي شيكات حتى الآن."
+        text = get_text(lang, "voucher_my_empty")
     else:
-        text = "📜 <b>آخر 10 شيكات قمت بإنشائها:</b>\n\n"
+        text = get_text(lang, "voucher_my_header")
         for v in vouchers:
             rem = max(0, v.max_uses - v.used_count)
-            status = f"🟢 متبقي {rem}/{v.max_uses}" if rem > 0 else "⚪ مكتمل/ملغى"
-            text += (
-                f"🏷️ <code>{esc(v.code)}</code> — {v.amount:,} غرام | {status}\n"
+            status = (
+                get_text(lang, "voucher_status_active", rem=rem, max_uses=v.max_uses)
+                if rem > 0
+                else get_text(lang, "voucher_status_done")
+            )
+            text += get_text(
+                lang, "voucher_row", code=esc(v.code), amount=v.amount, status=status
             )
             if rem > 0:
                 refund_est = rem * v.amount
                 keyboard.append(
                     [
                         InlineKeyboardButton(
-                            f"🗑️ إلغاء {v.code} واسترداد {refund_est:,}",
+                            get_text(lang, "voucher_btn_cancel", code=v.code, refund=refund_est),
                             callback_data=f"cancel_voucher_{v.id}",
                         )
                     ]
                 )
 
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="my_vouchers")])
+    keyboard.append([InlineKeyboardButton(get_text(lang, "btn_back"), callback_data="my_vouchers")])
     markup = InlineKeyboardMarkup(keyboard)
     if query:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
@@ -391,10 +388,11 @@ async def show_my_vouchers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_voucher_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
+    lang = get_user_lang(db_user)
     query = update.callback_query
     user_id = update.effective_user.id
     v_id = int(query.data.replace("cancel_voucher_", ""))
@@ -404,7 +402,7 @@ async def cancel_voucher_callback(update: Update, context: ContextTypes.DEFAULT_
             await session.execute(select(Voucher).where(Voucher.id == v_id))
         ).scalar_one_or_none()
         if not v_probe or v_probe.created_by != user_id:
-            await query.answer("❌ الشيك غير موجود أو لا تملكه.", show_alert=True)
+            await query.answer(get_text(lang, "voucher_err_not_owner"), show_alert=True)
             return
         v_code = v_probe.code
 
@@ -415,12 +413,13 @@ async def cancel_voucher_callback(update: Update, context: ContextTypes.DEFAULT_
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not v or v.created_by != user_id or not user:
-                await query.answer("❌ الشيك غير موجود.", show_alert=True)
+                await query.answer(get_text(lang, "voucher_err_not_found"), show_alert=True)
                 return
 
+            lang = get_user_lang(user)
             rem = max(0, v.max_uses - v.used_count)
             if rem <= 0:
-                await query.answer("⚠️ هذا الشيك مستهلك أو ملغى بالفعل.", show_alert=True)
+                await query.answer(get_text(lang, "voucher_err_already_done"), show_alert=True)
                 return
 
             refund = rem * v.amount
@@ -436,5 +435,5 @@ async def cancel_voucher_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             await session.commit()
 
-    await query.answer(f"✅ تم إلغاء الشيك واسترداد +{refund:,} غرام!", show_alert=True)
+    await query.answer(get_text(lang, "voucher_cancelled_alert", refund=refund), show_alert=True)
     await show_my_vouchers(update, context)

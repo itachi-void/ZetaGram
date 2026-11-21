@@ -8,15 +8,17 @@ from database.db import AsyncSessionLocal
 from database.models import User, Transaction
 from utils.security import user_lock_manager
 from utils.gatekeeper import enforce_user_access
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import utcnow
 
 
 async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, _ = await enforce_user_access(update, context)
+    ok, db_user = await enforce_user_access(update, context)
     if not ok:
         return
 
     user_id = update.effective_user.id
+    lang = get_user_lang(db_user)
     now = utcnow()
 
     async with user_lock_manager.get_lock(user_id):
@@ -25,8 +27,10 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.execute(select(User).where(User.telegram_id == user_id))
             ).scalar_one_or_none()
             if not user:
-                await update.message.reply_text("❌ يرجى كتابة /start لتسجيل حسابك أولاً.")
+                await update.message.reply_text(get_text(lang, "not_registered"))
                 return
+
+            lang = get_user_lang(user)
 
             if user.last_daily_bonus:
                 elapsed = now - user.last_daily_bonus
@@ -36,14 +40,17 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     minutes, _ = divmod(remainder, 60)
 
                     await update.message.reply_text(
-                        f"⌛ <b>لقد حصلت على مكافأتك اليومية بالفعل!</b>\n\n"
-                        f"🔥 سلسلتك الحالية: <b>{user.daily_streak or 1} يوم</b>\n"
-                        f"يمكنك المطالبة بالمكافأة القادمة بعد: <b>{hours} ساعة و {minutes} دقيقة</b>.",
+                        get_text(
+                            lang,
+                            "bonus_already_claimed",
+                            streak=user.daily_streak or 1,
+                            hours=hours,
+                            minutes=minutes,
+                        ),
                         parse_mode="HTML",
                     )
                     return
 
-                # Reset streak if > 48 hours elapsed
                 if elapsed <= timedelta(hours=48):
                     new_streak = (user.daily_streak or 0) + 1
                 else:
@@ -72,10 +79,13 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     next_idx = min(new_streak, len(STREAK_REWARDS) - 1)
     next_reward = STREAK_REWARDS[next_idx]
     await update.message.reply_text(
-        f"🎁 <b>مبروك! تم إضافة المكافأة اليومية إلى رصيدك!</b>\n\n"
-        f"🔥 <b>سلسلة الدخول المتتالية:</b> اليوم <b>{new_streak}</b>\n"
-        f"💰 <b>الهدية المستلمة:</b> +{reward:,} غرام\n"
-        f"💳 <b>رصيدك الحالي:</b> {new_balance:,} غرام\n\n"
-        f"✨ مكافأتك غداً ستكون: <b>+{next_reward:,} غرام</b>!",
+        get_text(
+            lang,
+            "bonus_claimed_success",
+            streak=new_streak,
+            reward=reward,
+            balance=new_balance,
+            next_reward=next_reward,
+        ),
         parse_mode="HTML",
     )

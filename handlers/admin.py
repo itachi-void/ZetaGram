@@ -4,12 +4,24 @@ import tempfile
 from datetime import timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from config import BOT_NAME
 from database.db import AsyncSessionLocal, create_safe_sqlite_backup
-from database.models import User, Task, UserTask, DisputeTicket, TaskReport, Transaction
+from database.models import (
+    User,
+    Task,
+    UserTask,
+    DisputeTicket,
+    TaskReport,
+    Transaction,
+    PromoCode,
+    FlashEvent,
+)
 from utils.security import is_admin_user, sanitize_amount, user_lock_manager
+from utils.telegram_api import parse_telegram_post_link, check_bot_is_admin
+from utils.promotions import format_multiplier
+from utils.i18n import get_text, get_user_lang
 from utils.html_utils import esc, utcnow
 
 
@@ -43,6 +55,9 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🚨 بلاغات المهام", callback_data="admin_reports_manage"),
             InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="admin_mand_subs_view"),
+        ],
+        [
+            InlineKeyboardButton("🔥 العروض والأكواد (Promos & Events)", callback_data="admin_promos_menu"),
         ],
         [
             InlineKeyboardButton("📢 الإذاعة العامة (Broadcast)", callback_data="admin_broadcast_help"),
@@ -668,6 +683,17 @@ async def add_task_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = None if args[4] in ("-", "none", "null") else args[4]
     title = " ".join(args[5:])
 
+    target_msg_id = None
+    auto_rx = False
+    if task_type in ("reaction_random", "reaction_fixed"):
+        parsed_chat, parsed_msg = parse_telegram_post_link(target_url)
+        if not chat_id and parsed_chat:
+            chat_id = parsed_chat
+        target_msg_id = parsed_msg
+        if chat_id and target_msg_id:
+            is_adm, _ = await check_bot_is_admin(context.bot, chat_id)
+            auto_rx = bool(is_adm)
+
     async with AsyncSessionLocal() as session:
         new_task = Task(
             title=title[:128],
@@ -678,10 +704,353 @@ async def add_task_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_qty=qty,
             escrow_balance=reward * qty,
             requires_premium=(task_type == "premium"),
+            target_message_id=target_msg_id,
+            auto_verify_reactions=auto_rx,
             created_by=user_id,
         )
         session.add(new_task)
         await session.commit()
         tid = new_task.id
 
-    await update.message.reply_text(f"🎉 تم إضافة المهمة بنجاح برقم ID: <code>{tid}</code>", parse_mode="HTML")
+    rx_info = " ⚡ (تحقق تفاعل تلقائي مفعّل)" if auto_rx else ""
+    await update.message.reply_text(
+        f"🎉 تم إضافة المهمة بنجاح برقم ID: <code>{tid}</code>{rx_info}", parse_mode="HTML"
+    )
+
+
+async def admin_promos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin_user(user_id, context.bot, "admin_promos_menu"):
+        return
+
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    now = utcnow()
+    async with AsyncSessionLocal() as session:
+        events = (
+            await session.execute(
+                select(FlashEvent)
+                .where(FlashEvent.is_active == True, FlashEvent.ends_at > now)
+                .order_by(FlashEvent.id.desc())
+                .limit(5)
+            )
+        ).scalars().all()
+        promos = (
+            await session.execute(
+                select(PromoCode).order_by(PromoCode.id.desc()).limit(10)
+            )
+        ).scalars().all()
+
+    lines = ["🔥 <b>إدارة العروض الترويجية وساعات الذروة:</b>\n"]
+    keyboard = []
+
+    if events:
+        lines.append("⚡ <b>أحداث ساعات الذروة النشطة:</b>")
+        for ev in events:
+            mult_s = format_multiplier(ev.multiplier_pct)
+            lines.append(
+                f"• <b>#{ev.id} {esc(ev.title)}</b> — <code>{mult_s}</code> (حتى <code>{ev.ends_at.strftime('%Y-%m-%d %H:%M UTC')}</code>)"
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(f"⏹️ إيقاف #{ev.id}", callback_data=f"admin_stop_flash_{ev.id}"),
+                    InlineKeyboardButton(f"📢 إشعار الكل #{ev.id}", callback_data=f"admin_notify_flash_{ev.id}"),
+                ]
+            )
+    else:
+        lines.append("⚪ لا توجد أحداث ساعات ذروة نشطة حالياً.")
+
+    lines.append("\n🎟️ <b>أكواد الخصم الأخيرة:</b>")
+    if promos:
+        for p in promos:
+            st = "🟢" if p.is_active else "🔴"
+            scope_ar = "الإجمالي" if p.discount_scope == "total" else "العمولة"
+            lines.append(
+                f"{st} <code>{esc(p.code)}</code> — خصم <b>{p.discount_percent}%</b> ({scope_ar}) | "
+                f"الاستخدام: <code>{p.used_count}/{p.max_uses}</code>"
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"⏯️ {'تعطيل' if p.is_active else 'تفعيل'} {p.code}",
+                        callback_data=f"admin_toggle_promo_{p.id}",
+                    )
+                ]
+            )
+    else:
+        lines.append("لا توجد أكواد خصم مضافة بعد.")
+
+    lines.append(
+        "\n📌 <b>الأوامر السريعة للأدمن:</b>\n"
+        "• إنشاء كود خصم:\n"
+        "<code>/addpromo &lt;CODE&gt; &lt;DISCOUNT_%&gt; &lt;MAX_USES&gt; [commission|total] [HOURS] [MIN_ORDER]</code>\n"
+        "• إطلاق ساعات ذروة (مثال 2x لمدة ساعتين):\n"
+        "<code>/flash &lt;MULTIPLIER&gt; &lt;HOURS&gt; [TITLE...]</code>\n"
+        "• إيقاف كل الأحداث: <code>/stopflash</code>"
+    )
+
+    keyboard.append([InlineKeyboardButton("🔙 رجوع للوحة الأدمن", callback_data="admin_main_menu")])
+    markup = InlineKeyboardMarkup(keyboard)
+    text = "\n".join(lines)
+    if query:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def handle_add_promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin_user(user_id, context.bot, "/addpromo"):
+        return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "⚠️ <b>الصيغة الصحيحة:</b>\n"
+            "<code>/addpromo &lt;CODE&gt; &lt;DISCOUNT_%&gt; &lt;MAX_USES&gt; [commission|total] [HOURS_VALID] [MIN_ORDER]</code>\n\n"
+            "مثال: <code>/addpromo ZETA50 50 100 commission 72 1000</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    code = args[0].strip().upper()
+    if len(code) < 2 or len(code) > 40 or not code.replace("-", "").replace("_", "").isalnum():
+        await update.message.reply_text("❌ كود الخصم يجب أن يتكون من 2 إلى 40 حرف/رقم إنجليزي.")
+        return
+
+    scope = "commission"
+    if len(args) >= 4 and args[3].strip().lower() in ("commission", "total"):
+        scope = args[3].strip().lower()
+
+    max_pct = 50 if scope == "total" else 100
+    ok_d, pct, err_d = sanitize_amount(args[1], min_val=1, max_val=max_pct)
+    if not ok_d:
+        await update.message.reply_text(err_d)
+        return
+
+    ok_u, max_uses, err_u = sanitize_amount(args[2], min_val=1, max_val=1_000_000)
+    if not ok_u:
+        await update.message.reply_text(err_u)
+        return
+
+    expires_at = None
+    if len(args) >= 5:
+        try:
+            hours = float(args[4])
+            if hours > 0:
+                expires_at = utcnow() + timedelta(hours=min(hours, 8760))
+        except ValueError:
+            await update.message.reply_text("❌ عدد الساعات غير صحيح.")
+            return
+
+    min_order = 0
+    if len(args) >= 6:
+        ok_m, min_order, err_m = sanitize_amount(args[5], min_val=0, max_val=100_000_000)
+        if not ok_m:
+            await update.message.reply_text(err_m)
+            return
+
+    async with AsyncSessionLocal() as session:
+        existing = (
+            await session.execute(select(PromoCode).where(PromoCode.code == code))
+        ).scalar_one_or_none()
+        if existing:
+            await update.message.reply_text(f"⚠️ الكود <code>{esc(code)}</code> موجود مسبقاً.", parse_mode="HTML")
+            return
+
+        promo = PromoCode(
+            code=code,
+            discount_percent=pct,
+            discount_scope=scope,
+            max_uses=max_uses,
+            used_count=0,
+            min_order_grams=min_order,
+            expires_at=expires_at,
+            is_active=True,
+            created_by=user_id,
+        )
+        session.add(promo)
+        await session.commit()
+
+    exp_str = expires_at.strftime("%Y-%m-%d %H:%M UTC") if expires_at else "غير محدد"
+    await update.message.reply_text(
+        f"✅ <b>تم إنشاء كود الخصم بنجاح!</b>\n\n"
+        f"🎟️ الكود: <code>{esc(code)}</code>\n"
+        f"📉 الخصم: <b>{pct}%</b> (<code>{scope}</code>)\n"
+        f"👥 الاستخدامات: <code>{max_uses:,}</code>\n"
+        f"💵 الحد الأدنى للطلب: <code>{min_order:,}</code> غرام\n"
+        f"⏳ الصلاحية: <code>{exp_str}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def handle_flash_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin_user(user_id, context.bot, "/flash"):
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ <b>الصيغة الصحيحة:</b>\n"
+            "<code>/flash &lt;MULTIPLIER&gt; &lt;HOURS&gt; [TITLE...]</code>\n\n"
+            "مثال: <code>/flash 2 3 Happy Hour X2</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        multiplier = float(args[0])
+        hours = float(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إدخال أرقام صحيحة للمضاعف وعدد الساعات.")
+        return
+
+    if not (1.1 <= multiplier <= 5.0):
+        await update.message.reply_text("❌ المضاعف يجب أن يكون بين 1.1 و 5.0 (مثال: 1.5 أو 2).")
+        return
+    if not (0.25 <= hours <= 168.0):
+        await update.message.reply_text("❌ المدة يجب أن تكون بين 0.25 و 168 ساعة.")
+        return
+
+    mult_pct = int(round(multiplier * 100))
+    title = " ".join(args[2:]).strip()[:120] if len(args) > 2 else f"Happy Hour {format_multiplier(mult_pct)}"
+    now = utcnow()
+    ends_at = now + timedelta(hours=hours)
+
+    async with AsyncSessionLocal() as session:
+        ev = FlashEvent(
+            title=title,
+            multiplier_pct=mult_pct,
+            starts_at=now,
+            ends_at=ends_at,
+            is_active=True,
+            created_by=user_id,
+        )
+        session.add(ev)
+        await session.commit()
+        ev_id = ev.id
+
+    await update.message.reply_text(
+        f"🔥 <b>تم إطلاق حدث ساعات الذروة (#{ev_id})!</b>\n\n"
+        f"🏷️ العنوان: <b>{esc(title)}</b>\n"
+        f"⚡ المضاعف: <code>{format_multiplier(mult_pct)}</code>\n"
+        f"⏰ ينتهي في: <code>{ends_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📢 إرسال إشعار للمستخدمين", callback_data=f"admin_notify_flash_{ev_id}")],
+                [InlineKeyboardButton("⏹️ إيقاف الحدث", callback_data=f"admin_stop_flash_{ev_id}")],
+            ]
+        ),
+    )
+
+
+async def handle_stop_flash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin_user(user_id, context.bot, "/stopflash"):
+        return
+
+    async with AsyncSessionLocal() as session:
+        active_events = (
+            await session.execute(select(FlashEvent).where(FlashEvent.is_active == True))
+        ).scalars().all()
+        stopped = 0
+        for ev in active_events:
+            ev.is_active = False
+            stopped += 1
+        await session.commit()
+
+    await update.message.reply_text(
+        f"⏹️ تم إيقاف <b>{stopped}</b> حدث ساعات ذروة.", parse_mode="HTML"
+    )
+
+
+async def _run_flash_notify_bg(
+    bot, admin_id: int, title: str, mult_str: str, ends_str: str, recipients: list[tuple[int, str]]
+):
+    sent = 0
+    failed = 0
+    for uid, u_lang in recipients:
+        try:
+            msg = get_text(
+                u_lang,
+                "flash_broadcast_notif",
+                bot_name=esc(BOT_NAME),
+                title=esc(title),
+                mult=mult_str,
+                ends=ends_str,
+            )
+            await bot.send_message(chat_id=uid, text=msg, parse_mode="HTML")
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f"📢 اكتمل إشعار حدث الذروة: ✅ {sent:,} | ❌ {failed:,}",
+        )
+    except Exception:
+        pass
+
+
+async def handle_admin_promo_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin_user(user_id, context.bot, "admin_promo_cb"):
+        return
+
+    query = update.callback_query
+    data = query.data
+
+    if data.startswith("admin_stop_flash_"):
+        ev_id = int(data.replace("admin_stop_flash_", ""))
+        async with AsyncSessionLocal() as session:
+            ev = (await session.execute(select(FlashEvent).where(FlashEvent.id == ev_id))).scalar_one_or_none()
+            if ev:
+                ev.is_active = False
+                await session.commit()
+        await query.answer("⏹️ تم إيقاف حدث الذروة.", show_alert=True)
+        await admin_promos_menu(update, context)
+
+    elif data.startswith("admin_toggle_promo_"):
+        pid = int(data.replace("admin_toggle_promo_", ""))
+        async with AsyncSessionLocal() as session:
+            p = (await session.execute(select(PromoCode).where(PromoCode.id == pid))).scalar_one_or_none()
+            if p:
+                p.is_active = not bool(p.is_active)
+                await session.commit()
+        await query.answer("✅ تم تحديث حالة الكود.", show_alert=True)
+        await admin_promos_menu(update, context)
+
+    elif data.startswith("admin_notify_flash_"):
+        ev_id = int(data.replace("admin_notify_flash_", ""))
+        async with AsyncSessionLocal() as session:
+            ev = (await session.execute(select(FlashEvent).where(FlashEvent.id == ev_id))).scalar_one_or_none()
+            if not ev or not ev.is_active:
+                await query.answer("⚠️ الحدث غير نشط أو غير موجود.", show_alert=True)
+                return
+            rows = (
+                await session.execute(
+                    select(User.telegram_id, User.language).where(
+                        or_(User.notifications_enabled == True, User.notifications_enabled.is_(None))
+                    )
+                )
+            ).all()
+
+        recipients = [(uid, (lang or "ar").lower()) for uid, lang in rows]
+        await query.answer("📢 جاري إرسال الإشعارات بالخلفية...", show_alert=True)
+        asyncio.create_task(
+            _run_flash_notify_bg(
+                context.bot,
+                user_id,
+                ev.title,
+                format_multiplier(ev.multiplier_pct),
+                ev.ends_at.strftime("%Y-%m-%d %H:%M"),
+                recipients,
+            )
+        )
+
