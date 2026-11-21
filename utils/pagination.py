@@ -8,7 +8,7 @@ def build_pagination_keyboard(
     back_callback: str = "earnings_menu"
 ) -> InlineKeyboardMarkup:
     """
-    Builds task inline keyboard with pagination bar matching PR GRAM UI.
+    Builds task inline keyboard with pagination bar matching ZetaGram UI.
     """
     keyboard = []
     

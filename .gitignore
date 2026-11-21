@@ -1,9 +1,13 @@
 # Environment variables & secrets
 .env
 
-# Database
+# Database & Persistence
 *.db
+*.db-wal
+*.db-shm
 bot.db
+bot_persistence.pickle
+*.bak
 
 # Python bytecode & virtual environment
 __pycache__/
@@ -11,6 +15,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
 
 # IDE / Editor files
 .vscode/

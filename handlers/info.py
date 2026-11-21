@@ -1,74 +1,160 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from sqlalchemy import select, func
+
+from config import BOT_NAME, REFERRAL_JOIN_BONUS, REFERRAL_ACTIVE_BONUS, DAILY_QUEST_TARGET, DAILY_QUEST_REWARD
 from database.db import AsyncSessionLocal
 from database.models import User, Task, UserTask
-from utils.telegram_api import check_user_subscription
-from handlers.dynamic_subs import get_active_mandatory_channels
+from utils.telegram_api import check_user_subscription_status
+from utils.gatekeeper import (
+    enforce_user_access,
+    get_mandatory_channels_list,
+    invalidate_sub_cache,
+)
+from utils.i18n import get_text
+from utils.html_utils import esc
+
 
 async def show_useful_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channels = await get_active_mandatory_channels()
+    ok, _ = await enforce_user_access(update, context)
+    if not ok:
+        return
+
+    channels = await get_mandatory_channels_list()
     links_str = ""
     for c in channels:
-        links_str += f"📢 **{c['title']}:**\n{c['channel_link']}\n\n"
+        links_str += f"📢 <b>{esc(c['title'])}:</b>\n{esc(c['channel_link'])}\n\n"
+    if not links_str:
+        links_str = "لا توجد روابط إضافية مضافة حالياً.\n\n"
 
     text = (
-        "🔗 **الروابط المفيدة:**\n\n"
+        f"🔗 <b>الروابط المفيدة ({esc(BOT_NAME)}):</b>\n\n"
         f"{links_str}"
-        "💡 اضغط على الروابط أعلاه لمتابعة آخر التحديثات وحركات التمويل."
+        "💡 اضغط على الروابط أعلاه لمتابعة آخر التحديثات وأخبار الشبكة."
     )
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")]]
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
 
 async def show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, _ = await enforce_user_access(update, context)
+    if not ok:
+        return
+
     text = (
-        "📋 **دليل وتعليمات الاستخدام:**\n\n"
-        "1️⃣ **كسب الأرباح:** اختر `🧑‍💻 الأرباح` واشترك في القنوات والمجموعات المتاحة ثم اضغط على زر `🔄 فحص` للحصول على الرصيد.\n"
-        "2️⃣ **الترويج لقناتك:** اختر `📣 الترويج` وحدد نوع الحساب والعدد وسعر الاشتراك للحصول على مشتركين حقيقيين.\n"
-        "3️⃣ **المكافأة اليومية:** اضغط `🎁 المكافأة اليومية` يومياً للحصول على +100 غرام مجاناً.\n"
-        "4️⃣ **نظام الإحالة:** انشر رابطك الخاص من قسم `📱 حسابي` واكسب نقاط إضافية عن كل صديق يكمل 3 مهام.\n"
-        "5️⃣ **الشيكات وتحويل الرصيد:** يمكنك تحويل الرصيد لأصدقائك أو إنشاء شيكات هدايا.\n\n"
-        "⚠️ **ملاحظة هامة:** يُمنع مغادرة القنوات قبل 7 أيام لتجنب الخصم والحظر."
+        f"📋 <b>دليل وتعليمات استخدام {esc(BOT_NAME)}:</b>\n\n"
+        "1️⃣ <b>كسب الأرباح:</b> اختر «🧑‍💻 الأرباح» واشترك في القنوات أو نفّذ مهام البوتات والمنشورات.\n"
+        "2️⃣ <b>الترويج لقناتك:</b> اختر «📣 الترويج» وحدد النوع والجمهور والسعر مع ضمان مالي Escrow كامل.\n"
+        "3️⃣ <b>المكافأة اليومية والتحدي:</b> سلسلة دخول يومي تصاعدية حتى +500 غرام + "
+        f"تحدي {DAILY_QUEST_TARGET} مهام يومية (+{DAILY_QUEST_REWARD} غرام) + عجلة الحظ (<code>/spin</code>).\n"
+        "4️⃣ <b>نظام الإحالة:</b> ادعُ أصدقاءك واكسب "
+        f"+{REFERRAL_ACTIVE_BONUS} غرام عن كل صديق نشط + <b>10% عمولة دائمة</b> (ويحصل صديقك على +{REFERRAL_JOIN_BONUS} غرام).\n"
+        "5️⃣ <b>الخزنة واليانصيب والشيكات:</b> استثمر رصيدك في الخزنة (<code>/vault</code>) أو شارك باليانصيب (<code>/raffle</code>).\n\n"
+        "⚠️ <b>ملاحظة هامة:</b> يُمنع مغادرة القنوات قبل 7 أيام لتجنب الخصم التلقائي والحظر."
     )
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")]]
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 
 async def show_bot_public_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, _ = await enforce_user_access(update, context)
+    if not ok:
+        return
+
     async with AsyncSessionLocal() as session:
         users_cnt = (await session.execute(select(func.count(User.telegram_id)))).scalar() or 0
         tasks_cnt = (await session.execute(select(func.count(Task.id)))).scalar() or 0
-        completed_cnt = (await session.execute(select(func.count(UserTask.id)))).scalar() or 0
+        completed_cnt = (
+            await session.execute(
+                select(func.count(UserTask.id)).where(UserTask.status.in_(["completed", "approved"]))
+            )
+        ).scalar() or 0
 
     text = (
-        "📊 **إحصائيات الشبكة:**\n\n"
-        f"👥 **إجمالي المستخدمين:** `{users_cnt:,}`\n"
-        f"📌 **إجمالي المهام المضافة:** `{tasks_cnt:,}`\n"
-        f"✅ **المهام المنفذة:** `{completed_cnt:,}`\n"
-        f"⚡ **سرعة التنفيذ:** فوري 100%"
+        f"📊 <b>إحصائيات شبكة {esc(BOT_NAME)}:</b>\n\n"
+        f"👥 <b>إجمالي المستخدمين:</b> <code>{users_cnt:,}</code>\n"
+        f"📌 <b>إجمالي الحملات:</b> <code>{tasks_cnt:,}</code>\n"
+        f"✅ <b>المهام المنفذة بنجاح:</b> <code>{completed_cnt:,}</code>\n"
+        f"⚡ <b>سرعة التحقق:</b> فوري وآمن 100%"
     )
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")]]
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [
+        [InlineKeyboardButton("🏆 لوحة المتصدرين الأسبوعية", callback_data="show_leaderboard")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="close_menu")],
+    ]
+    await update.message.reply_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def _find_unsubbed_mandatory(bot, user_id: int):
+    channels = await get_mandatory_channels_list()
+    unsubbed = []
+    for c in channels:
+        status = await check_user_subscription_status(bot, c["channel_username"], user_id)
+        if status == "not_member":
+            unsubbed.append(c)
+    return unsubbed
+
 
 async def check_forced_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, user = await enforce_user_access(
+        update, context, require_mandatory_sub=False
+    )
+    if not ok:
+        return
+
     user_id = update.effective_user.id
-    channels = await get_active_mandatory_channels()
+    lang = user.language if user and user.language else "ar"
+    invalidate_sub_cache(user_id)
 
-    unsubbed_channels = []
-    for c in channels:
-        is_subbed = await check_user_subscription(context.bot, c["channel_username"], user_id)
-        if not is_subbed:
-            unsubbed_channels.append(c)
-
-    if not unsubbed_channels:
-        await update.message.reply_text("✅ **حسابك مفعّل ومكتمل الاشتراك في جميع القنوات الإجبارية!**", parse_mode="Markdown")
+    unsubbed = await _find_unsubbed_mandatory(context.bot, user_id)
+    if not unsubbed:
+        await update.message.reply_text(get_text(lang, "forced_sub_ok"), parse_mode="HTML")
     else:
-        keyboard = []
-        for c in unsubbed_channels:
-            keyboard.append([InlineKeyboardButton(f"📢 {c['title']}", url=c["channel_link"])])
+        keyboard = [
+            [InlineKeyboardButton(f"📢 {c['title']}", url=c["channel_link"])]
+            for c in unsubbed
+        ]
         keyboard.append([InlineKeyboardButton("🔄 تحقق الآن", callback_data="recheck_forced_sub")])
-
         await update.message.reply_text(
-            "⚠️ **أنت غير مشترك في القنوات الإجبارية التالية!**\nيرجى الاشتراك في القنوات أدناه ثم الضغط على تحقق الآن.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            get_text(lang, "forced_sub_required"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def recheck_forced_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, user = await enforce_user_access(
+        update, context, require_mandatory_sub=False
+    )
+    if not ok:
+        return
+
+    query = update.callback_query
+    user_id = update.effective_user.id
+    lang = user.language if user and user.language else "ar"
+    invalidate_sub_cache(user_id)
+
+    unsubbed = await _find_unsubbed_mandatory(context.bot, user_id)
+    if not unsubbed:
+        await query.answer("✅ تم التحقق من الاشتراك بنجاح!", show_alert=True)
+        await query.edit_message_text(get_text(lang, "forced_sub_ok"), parse_mode="HTML")
+    else:
+        await query.answer("❌ لم تنضم لجميع القنوات الإجبارية بعد!", show_alert=True)
+        keyboard = [
+            [InlineKeyboardButton(f"📢 {c['title']}", url=c["channel_link"])]
+            for c in unsubbed
+        ]
+        keyboard.append([InlineKeyboardButton("🔄 تحقق الآن", callback_data="recheck_forced_sub")])
+        await query.edit_message_text(
+            get_text(lang, "forced_sub_required"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )

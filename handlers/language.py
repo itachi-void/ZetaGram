@@ -1,16 +1,20 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 from sqlalchemy import select
+
 from database.db import AsyncSessionLocal
 from database.models import User
-from handlers.start import get_main_keyboard, start_command_after_language, build_language_keyboard
+from handlers.start import start_command_after_language, build_language_keyboard
 from utils.i18n import get_text
+
 
 async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     async with AsyncSessionLocal() as session:
-        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+        user = (
+            await session.execute(select(User).where(User.telegram_id == user_id))
+        ).scalar_one_or_none()
         lang = user.language if user else "ar"
 
     text = get_text(lang, "lang_select_title")
@@ -18,9 +22,14 @@ async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=reply_markup
+        )
     else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=reply_markup
+        )
+
 
 async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -29,12 +38,13 @@ async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TY
     new_lang = query.data.replace("set_lang_", "")
 
     async with AsyncSessionLocal() as session:
-        user = (await session.execute(select(User).where(User.telegram_id == user_id))).scalar_one_or_none()
+        user = (
+            await session.execute(select(User).where(User.telegram_id == user_id))
+        ).scalar_one_or_none()
         if user:
             user.language = new_lang
             await session.commit()
 
-    # Proceed to welcome message / start flow after language is set
     try:
         await query.delete_message()
     except Exception:

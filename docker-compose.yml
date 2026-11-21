@@ -1,0 +1,26 @@
+services:
+  zetagram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zetagram_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/bot.db
+      - PERSISTENCE_FILE=/app/data/bot_persistence.pickle
+    volumes:
+      - zetagram_data:/app/data
+    # If running with Telegram Webhook instead of polling, uncomment the port:
+    # ports:
+    #   - "${WEBHOOK_PORT:-8080}:8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  zetagram_data:
+    driver: local
